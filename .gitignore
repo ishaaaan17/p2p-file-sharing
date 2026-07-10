@@ -1,0 +1,21 @@
+# Visual Studio artifacts
+.vs/
+[Dd]ebug/
+[Rr]elease/
+x64/
+*.user
+*.suo
+*.vcxproj*
+
+# CMake build outputs
+out/
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Executables
+*.exe
+*.pdb
+*.obj
+*.ilk
