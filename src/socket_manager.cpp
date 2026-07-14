@@ -10,68 +10,112 @@ namespace P2P {
     }
 
     bool SocketManager::start(uint16_t port) {
-        if (m_is_running) {
-            std::cout << "[SocketManager] Warning: Node instance is already active." << std::endl;
+        if (m_is_running.load()) {
+            std::cout << "[SocketManager] Warning: Background thread is already active." << std::endl;
             return true;
         }
 
-        // 1. Allocate a fresh socket instance utilizing our RAII tracking handle
         m_listening_socket = std::make_unique<ReliableSocket>();
 
-        // 2. Wake up Winsock and build the kernel descriptor structures
         if (!m_listening_socket->initialize()) {
-            std::cerr << "[SocketManager] Critical initialization fault triggered in ReliableSocket." << std::endl;
+            std::cerr << "[SocketManager] Critical initialization fault." << std::endl;
             m_listening_socket.reset();
             return false;
         }
 
-        // 3. Bind to the local network architecture interface port
         if (!m_listening_socket->bind_to_port(port)) {
-            std::cerr << "[SocketManager] Critical bind fault. Target port " << port << " might be in use." << std::endl;
+            std::cerr << "[SocketManager] Critical bind fault on port: " << port << std::endl;
             m_listening_socket->close_socket();
             m_listening_socket.reset();
             return false;
         }
 
         m_current_port = port;
-        m_is_running = true;
-        std::cout << "[SocketManager] Node successfully operational on network port: " << m_current_port << std::endl;
+        m_is_running.store(true);
+
+        // Spawn our dedicated worker thread to handle input loops in the background
+        m_worker_thread = std::thread(&SocketManager::network_worker_loop, this);
+
+        std::cout << "[SocketManager] Threaded background receiver running on port: " << m_current_port << std::endl;
         return true;
     }
 
     bool SocketManager::send_data_to(const Packet& packet, const std::string& ip, uint16_t port) {
-        if (!m_is_running || !m_listening_socket) {
-            std::cerr << "[SocketManager] Error: Cannot dispatch packets while state is inactive." << std::endl;
+        if (!m_is_running.load() || !m_listening_socket) {
+            std::cerr << "[SocketManager] Error: Cannot transmit while thread is dead." << std::endl;
             return false;
         }
-
-        // Forward the message target down to the Winsock pipeline layer
         return m_listening_socket->send_packet(packet, ip, port);
     }
 
-    bool SocketManager::poll_incoming_traffic(Packet& out_packet, std::string& out_ip, uint16_t& out_port) {
-        if (!m_is_running || !m_listening_socket) return false;
+    // High Performance Non-Blocking Interface: Instantly returns true if a frame exists
+    bool SocketManager::pop_incoming_frame(Packet& out_packet, std::string& out_ip, uint16_t& out_port) {
+        std::unique_lock<std::mutex> lock(m_queue_mutex); // Lock access to the storage queue
 
-        // At this specific phase, this will safely execute a blocking intercept wrapper.
-        // In the next phase of architecture, we will integrate non-blocking state polling 
-        // using Winsock select() or worker threads so the main execution path remains fluid.
-        return m_listening_socket->receive_packet(out_packet, out_ip, out_port);
+        if (m_inbound_queue.empty()) {
+            return false; // Instant fallback - does not block the main application loop!
+        }
+
+        // Pull the front item from our thread-safe buffer
+        InboundNetworkFrame frame = m_inbound_queue.front();
+        m_inbound_queue.pop();
+
+        out_packet = frame.packet;
+        out_ip = frame.sender_ip;
+        out_port = frame.sender_port;
+
+        return true;
+    }
+
+    void SocketManager::network_worker_loop() {
+        while (m_is_running.load()) {
+            Packet captured_packet;
+            std::string source_ip;
+            uint16_t source_port = 0;
+
+            // Wait on the low-level Winsock block (this blocks the worker thread, NOT the main app)
+            if (m_listening_socket->receive_packet(captured_packet, source_ip, source_port)) {
+
+                // Critical Section: Acquire lock before modifying shared memory space
+                {
+                    std::unique_lock<std::mutex> lock(m_queue_mutex);
+                    m_inbound_queue.push({ captured_packet, source_ip, source_port });
+                }
+            }
+        }
     }
 
     void SocketManager::stop() {
-        if (!m_is_running) return;
+        if (!m_is_running.load()) return;
 
-        std::cout << "[SocketManager] Tearing down active socket allocations cleanly..." << std::endl;
+        std::cout << "[SocketManager] Signalling background thread shutdown sequence..." << std::endl;
 
+        // 1. Flip our atomic execution state flag
+        m_is_running.store(false);
+
+        // 2. Tear down the underlying Winsock descriptor block.
+        // This instantly causes any blocking receive_packet() loop on the worker thread to fail,
+        // preventing the worker thread from getting stuck forever.
         if (m_listening_socket) {
             m_listening_socket->close_socket();
+        }
 
-            // Explicitly force unique_ptr to delete the memory resource back to the OS heap
+        // 3. Gracefully wait for the OS to spin down the background thread safely
+        if (m_worker_thread.joinable()) {
+            m_worker_thread.join();
+        }
+
+        // 4. Free remaining heap resources safely
+        if (m_listening_socket) {
             m_listening_socket.reset();
         }
 
-        m_is_running = false;
-        m_current_port = 0;
+        // Clear out any residual packet junk left in the memory queue
+        std::unique_lock<std::mutex> lock(m_queue_mutex);
+        std::queue<InboundNetworkFrame> empty_queue;
+        std::swap(m_inbound_queue, empty_queue);
+
+        std::cout << "[SocketManager] Thread context recycled. Subsystem offline." << std::endl;
     }
 
 } // namespace P2P
