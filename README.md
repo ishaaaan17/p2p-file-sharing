@@ -1,199 +1,205 @@
-# P2P Core — A Decentralized File Sharing Engine in C++17
+# P2P Swarm Core — Decentralized File Sharing Engine (C++17) + Live Telemetry Dashboard (Python/Streamlit)
 
-A from-scratch peer-to-peer file distribution engine built on raw UDP sockets, with its own wire protocol, its own reliability layer, and its own threading model. No third-party networking library, no central tracker, no central server.
+## System Overview
 
----
+This project is a peer-to-peer file distribution engine written in C++17, running directly over raw UDP sockets with no external networking libraries. Every node in the swarm is simultaneously a data source and a data consumer — there is no central server, no tracker, and no single point of failure. Beyond the base transport, the engine layers in the mechanics that make real swarms work: pieces are written straight to disk instead of held in memory, a rarest-first scheduler decides what to request next, and a Tit-for-Tat choke system decides who gets served.
 
-## 1. Project Overview
-
-Most file transfers people interact with day to day — a browser download, an app update, a video stream — are client-server. One machine holds the file, everyone else requests a copy from it, and that one machine pays the bandwidth bill for every single request. It works fine until the file is popular or the server goes down, at which point it stops working for everyone at once.
-
-This project takes the opposite approach. Every node in the network — call it a peer — is simultaneously a **Seeder** (it can supply data it already has) and a **Leecher** (it can request data it's missing). There's no dedicated server node and no single point of failure. A file spreads through the swarm the same way a rumor spreads through a room: not from one source to everyone, but from whoever already knows it to whoever's standing nearby.
-
-To make that work, a file can't be treated as one solid object. It's sliced into uniform, fixed-size **pieces** — 1000 bytes each in the current implementation — and a `PieceManager` subsystem tracks, piece by piece, which ones a given node already has and which ones it's still missing. That per-piece bookkeeping is what lets two peers with only partial copies of a file still trade the parts they lack, rather than one having to wait for the other to finish downloading first.
-
-| | Client-Server | P2P Mesh (this project) |
-|---|---|---|
-| Data source | One server, always | Any peer holding the piece |
-| Bandwidth load | Concentrated on the server | Spread across the swarm |
-| Failure mode | Server down → nobody downloads | One peer down → others still serve |
-| Unit of transfer | Whole file (or byte range) | Fixed-size piece |
-| Scaling behavior | Gets worse as demand grows | Gets *better* as more peers join |
+Sitting alongside the C++ core is a Python dashboard built with Streamlit. It doesn't participate in the swarm — it has no piece data, no bitfield, no role in the protocol. It's a passive observer: the C++ binary fires small JSON status packets over a loopback UDP socket every time something swarm-relevant happens (a peer connects, a piece finishes downloading, someone gets choked), and the dashboard renders those events live in a browser tab.
 
 ---
 
-## 2. Technical Stack Deep-Dive
+## 🚀 Core Architectural Features
 
-### Why raw UDP, and what has to be built on top of it
+### Custom Framed Wire Protocol
+Every message on the wire — regardless of purpose — travels inside the same `Packet` structure: a type flag, a sequence number identifying which piece it concerns, a length field, and a payload buffer. Two control types were added in this phase on top of the original five:
 
-TCP already solves reliability — ordering, retransmission, congestion control — but it solves it in a way this project deliberately avoids, because the point of the exercise is to build that reliability layer by hand and understand exactly what it's doing. So the engine talks over raw UDP sockets instead, which hand you a datagram and offer no guarantee it arrived, arrived once, or arrived in order. Everything above that line is homegrown.
+| Type | Role |
+|---|---|
+| `SYN` | Opening handshake greeting |
+| `SYN_ACK` | Handshake reply, carries the responder's bitfield |
+| `DATA` | Piece request (empty payload) or piece delivery (full payload) |
+| `ACK` | Confirms a piece was received intact |
+| `FIN` | Clean, intentional session teardown |
+| `CHOKE` | Sent by a node refusing to serve another peer further data |
+| `UNCHOKE` | Sent by a node resuming service to a previously choked peer |
 
-That homegrown layer is really two things stacked together:
+`CHOKE` and `UNCHOKE` govern a new swarm state that sits on top of the base request/response cycle: a node can still be "connected" to a peer (post-handshake, bitfield exchanged) while being actively refused service at the piece level.
 
-1. **A framed wire protocol** (Section 3) that gives every packet a type, a sequence number, a length, and a checksum, so the receiving side can tell what a packet is for and whether it's intact.
-2. **An application-layer reliability engine** built from that framing: checksums to catch corruption, sequence numbers to identify which piece a packet refers to, and an ACK/retry pattern (Section 5) so a request for a missing piece doesn't just vanish into the network if the response is silently dropped.
+### Multi-Threaded Socket Pipeline (`SocketManager`)
+Unchanged in principle from the base engine: a background thread blocks on `recvfrom()` so the rest of the application never stalls waiting on the network, and hands finished frames off through a thread-safe queue to the main thread, which polls it on a steady interval and drives all the state machines described below. Every telemetry packet sent to the Python dashboard also goes out through this same socket — there is no second, dedicated telemetry socket. The C++ binary simply directs an extra `send_data_to()` call at `127.0.0.1:6000` whenever a swarm event happens, using the exact same `SocketManager` instance it uses for peer traffic.
 
-Neither of these exist at the OS socket level. UDP hands the application a chunk of bytes; it's on `P2P Core` to decide whether those bytes are trustworthy and what to do about it if they aren't.
+### High-Performance Disk Persistence (`PieceManager`)
+Piece data no longer lives in memory. `initialize_file_layout()` pre-allocates the full output file on disk up front — it writes `file_size` zero bytes once, so every later write is a fixed-offset overwrite rather than an append. `write_piece_to_disk()` opens the file in `std::ios::binary | std::ios::in | std::ios::out` (deliberately *not* truncating), calls `seekp(piece_idx * piece_size)` to jump to the piece's exact byte offset, and writes the payload directly there. Reads work the same way in reverse with `seekg()`, and correctly shrink the read length for the final piece if the file size isn't an exact multiple of the piece size. A `std::mutex` guards every disk operation, since both the listener thread's incoming writes and the main thread's outgoing reads can touch the same file.
 
-### Why the engine is multi-threaded
+One consequence worth knowing: every `write_piece_to_disk()` call opens and closes the file fresh. That's simple and safe under a mutex, but it's not the fastest possible approach — a version that kept the file handle open for the life of the session would cut down on repeated open/close overhead under heavy piece traffic.
 
-A raw UDP read (`recvfrom()`) blocks until a packet shows up. If that call sat on the same thread driving the rest of the application, the entire program would freeze every time it was waiting on the network — which, in practice, is most of the time. `SocketManager` solves this by splitting the work across two threads (full breakdown in Section 4.3): one thread does nothing but block on `recvfrom()` and hand off finished packets, and a second thread polls a shared queue at a steady 10ms interval and processes whatever's arrived. Neither thread waits on the other's slow work.
+### Swarm Intelligence & Rarest-First Scheduler
+`select_rarest_piece_to_request()` takes a snapshot of every connected peer's bitfield, tallies how many peers currently hold each piece index, and picks — among the pieces the *local* node is missing that *this specific remote peer* has — whichever one has the lowest count across the swarm. That's a correct implementation of rarest-first in spirit: it's actively trying to keep the least-available pieces from disappearing if a lone holder drops offline.
+
+The scheduling is bounded by what this build's data actually is, though. `remote_bitfield` is set once, at the moment a `SYN_ACK` is processed, and never updated afterward — there's no `HAVE`-style message telling a node "I just finished piece 4," so the rarity picture used for scheduling is a snapshot from handshake time, not a live view of the swarm.
+
+### Game-Theoretic Anti-Leech Protection (`ChokeManager`)
+The design intent is textbook Tit-for-Tat: track bytes given and bytes received per peer, and stop serving anyone who takes without giving back. The implementation tracks two maps — `uploaded_bytes_map` and `downloaded_bytes_map` — updated through `record_upload()` and `record_download()`, with `should_choke_peer()` reading them to decide.
+
+**Known issue:** the calls into this class from `main.cpp` are swapped relative to what the method names describe. When the local node *serves* a piece to a peer (an actual upload), the code calls `choke_mgr.record_download(...)`. When the local node *receives* a piece from a peer (an actual download), it calls `choke_mgr.record_upload(...)`. The practical effect: `should_choke_peer()` ends up choking a peer that has been sending you data generously before you've sent anything back — the opposite of the intended leech protection. The same swap exists in the plain `peer_uploaded_bytes` / `peer_downloaded_bytes` maps used for telemetry, so the numbers shown on the dashboard for "Downloaded" vs "Uploaded" per peer are similarly reversed from the local node's actual perspective. This doesn't crash anything or break the swarm mechanically — pieces still transfer correctly — but the choke decisions and the dashboard's byte counters do not currently mean what their labels say. Swapping which method is called at the two call sites in `main.cpp` (upload-path and download-path) resolves it.
+
+There is also no optimistic unchoke in this build — real BitTorrent occasionally unchokes a random peer regardless of score, to give new or slow peers a chance to prove themselves. This implementation is strict reciprocity only, evaluated per incoming piece request rather than on a fixed timer, and it only ever sends `CHOKE` — nothing in this code path currently emits an `UNCHOKE` packet back out.
+
+### Python Live Telemetry Dashboard
+`dashboard.py` runs as its own process. On first load it spins up a background Python thread that binds a UDP socket to `127.0.0.1:6000` and sits in a loop parsing whatever JSON frames arrive, updating `st.session_state`. The Streamlit frontend redraws on a roughly one-second loop (`time.sleep(1)` followed by `st.rerun()`), showing a per-piece status grid (Missing / Downloading / Completed), a connected-peer table with byte counters and choke state, and two buttons that don't actually trigger anything in the C++ process — they're currently visual only, since there's no reverse channel from the browser back to the swarm.
+
+Because every C++ node instance sends its telemetry to the same `127.0.0.1:6000` destination, a single running dashboard aggregates events from however many local nodes are active. Since the dashboard keys its peer table by the *remote* port each event refers to, running all three demo nodes against one dashboard gives a reasonable combined picture of swarm activity, though it doesn't distinguish which local node originated which event.
 
 ---
 
-## 3. The Wire Protocol — `Packet` Layout
-
-Every message in this system, regardless of purpose, goes out on the wire in the same fixed frame. A receiver doesn't need to guess the format — it reads the same nine bytes of header off every incoming datagram and knows immediately how to interpret what follows.
+## 🛠️ System Architecture Diagram
 
 ```
-+----------------+----------------+----------------+----------------+
-|  Type (1 byte) |  Sequence (4 bytes)             | Length (2 B)   |
-+----------------+----------------------------------+----------------+
-| Checksum (2 B) |  Payload (variable, up to `Length` bytes)          |
-+----------------+-----------------------------------------------------+
+                     ┌─────────────────────┐         ┌─────────────────────┐
+                     │   Seeder Node A      │         │   Seeder Node B      │
+                     │   (Peer ID 2002)     │         │   (Peer ID 2003)     │
+                     │   UDP :9999          │         │   UDP :8888          │
+                     │   Holds pieces 0-2    │         │   Holds pieces 3-5   │
+                     └──────────┬───────────┘         └──────────┬───────────┘
+                                │  SYN / SYN_ACK / DATA / ACK / CHOKE / FIN
+                                │  (raw UDP datagrams)
+                                └───────────────┬───────────────┘
+                                                ▼
+                              ┌───────────────────────────────────┐
+                              │      Downloader / Leecher Node      │
+                              │      (Peer ID 1001)  UDP :7777       │
+                              │                                       │
+                              │  ┌─────────────────────────────────┐ │
+                              │  │  Listener Thread                  │ │
+                              │  │  blocking recvfrom() loop         │ │
+                              │  │  → parses raw bytes into Packet   │ │
+                              │  │  → pushes onto thread-safe queue  │ │
+                              │  └───────────────┬───────────────────┘ │
+                              │                  │ (10ms poll)          │
+                              │  ┌───────────────▼───────────────────┐ │
+                              │  │  Main Thread                       │ │
+                              │  │  HandshakeManager                  │ │
+                              │  │  PeerSessionManager (rarest-first) │ │
+                              │  │  ChokeManager                      │ │
+                              │  │  PieceManager (disk seekp/seekg)   │ │
+                              │  └───────────────┬───────────────────┘ │
+                              └──────────────────┼──────────────────────┘
+                                                 │
+                                                 │  JSON telemetry frames
+                                                 │  (UDP loopback, same socket)
+                                                 ▼
+                              ┌───────────────────────────────────┐
+                              │  127.0.0.1 : 6000                    │
+                              │  Python Background Listener Thread   │
+                              │  → parses JSON → st.session_state    │
+                              └───────────────┬───────────────────┘
+                                              ▼
+                              ┌───────────────────────────────────┐
+                              │  Streamlit Browser UI                │
+                              │  Piece grid · Peer table · Progress  │
+                              └───────────────────────────────────┘
 ```
 
-| Field | Type | Size | Purpose |
-|---|---|---|---|
-| Type | `uint8_t` | 1 byte | Identifies the message kind — see `PacketType` table below |
-| Sequence | `uint32_t` | 4 bytes | The numeric index of the file piece this packet concerns |
-| Length | `uint16_t` | 2 bytes | Exact byte size of the payload that follows |
-| Checksum | `uint16_t` | 2 bytes | Integrity signature computed over the frame before it's sent |
-
-### `PacketType` values
-
-| Value | Name | Meaning |
-|---|---|---|
-| `1` | `SYN` | Opening greeting from a connecting peer |
-| `2` | `SYN_ACK` | Handshake reply, carries the responder's compressed bitfield |
-| `3` | `DATA` | Either a request for a piece (empty payload) or the piece itself (full payload) |
-| `4` | `ACK` | Confirms a piece was received and validated |
-| `5` | `FIN` | Signals a clean, intentional session close |
-
-### Checksums and corruption detection
-
-Before a `Packet` goes out, the sender runs a checksum calculation across the frame and stores the result in the checksum field. When the packet arrives, the receiver runs the identical calculation on the bytes it actually received and compares the two values. A match means the data is intact. A mismatch means something changed in transit — a dropped bit, a truncated payload, whatever the cause — and the frame is discarded on the spot rather than trusted. This is the first line of defense in the reliability engine: bad data never even reaches the piece-tracking logic upstream.
-
 ---
 
-## 4. Handshake Layer & Session Setup — `HandshakeManager`
+## 📦 Project Directory Structure
 
-Two peers don't just start exchanging file data the moment a socket opens. They run a short handshake first, both to confirm the other side actually speaks this protocol and to exchange the information needed to figure out what to trade.
-
-### 4.1 Step one — the `SYN`
-
-The initiating peer sends a `SYN` packet whose payload contains a hardcoded magic string: `"P2P-CORE-PROT-V1"`. This is a cheap but effective filter. If the connection came from a port scanner, a misconfigured client, or anything else that isn't running this exact protocol, the string won't match, and the responder drops the connection immediately rather than wasting cycles on it.
-
-### 4.2 Step two — the `SYN_ACK` and the bitfield
-
-Once the magic string checks out, the responder answers with a `SYN_ACK` packet. Its payload isn't just an acknowledgment — it's the responder's entire file map: which pieces it has, encoded as a bitfield (see Section 4.4 below for exactly how). This is the moment where a connecting peer learns what its new neighbor can actually offer.
-
-### 4.3 The threading behind packet delivery — `SocketManager`
-
-Handshake packets, like every other packet, flow through the same two-thread pipeline:
-
-- **Background Listener Thread** — sits in a loop on a blocking `recvfrom()` call against the raw UDP socket. The moment a datagram lands, it's parsed back into a structured `Packet` object and pushed onto a thread-safe queue. This thread does nothing else; it never touches application logic.
-- **Main Application Thread** — polls that queue on a 10ms interval. Whenever a `Packet` is waiting, it's pulled off and handed to the appropriate state machine (handshake, piece exchange, etc.). Because this thread never blocks on the network directly, the rest of the application — UI, local logic, anything else running — keeps moving even while a `recvfrom()` call is stalled on the listener thread.
-
-The two threads only ever communicate through that one queue, which keeps the concurrency model simple: no shared piece-tracking state gets touched from more than one thread at a time.
-
-### 4.4 Bitwise Serialization Compression
-
-A file map is, at its core, a list of booleans — one per piece, true if the peer has it, false if it doesn't. Sending that as a raw vector of booleans is wasteful; most language runtimes store a `bool` in a full byte even though it only carries one bit of real information.
-
-Instead, `HandshakeManager` packs eight piece statuses into a single `uint8_t`, using bit shifts to place piece 0 at the highest bit and piece 7 at the lowest:
-
-```cpp
-// Packing: 8 piece-completion flags into one byte
-uint8_t packed_byte = 0;
-for (int i = 0; i < 8; ++i) {
-    if (piece_status[i]) {
-        packed_byte |= (1 << (7 - i)); // piece 0 -> bit 7, piece 7 -> bit 0
-    }
-}
+```
+p2p-swarm-core/
+├── include/
+│   ├── packet.h                 # Packet struct + PacketType enum (SYN..UNCHOKE)
+│   ├── socket_manager.h         # Two-thread UDP transport, thread-safe frame queue
+│   ├── handshake_manager.h      # SYN / SYN_ACK exchange, bitfield compression
+│   ├── piece_manager.h          # Disk-backed piece storage, seekp/seekg I/O
+│   ├── peer_session_manager.h   # Rarest-first scheduling, request/response logic
+│   └── choke_manager.h          # Tit-for-Tat upload/download tracking
+│
+├── src/
+│   ├── socket_manager.cpp       # SocketManager implementation
+│   ├── handshake_manager.cpp    # HandshakeManager implementation
+│   ├── piece_manager.cpp        # Header-only class; translation unit only includes piece_manager.h
+│   ├── choke_manager.cpp        # Header-only class; translation unit only includes choke_manager.h
+│   └── main.cpp                 # Entry point: CLI setup, main event loop, telemetry dispatch
+│
+├── dashboard/
+│   ├── dashboard.py             # Streamlit UI + background UDP telemetry listener
+│   └── requirements.txt         # streamlit, pandas
+│
+├── LICENSE
+└── README.md
 ```
 
-```cpp
-// Unpacking: reading the flags back out with a bitmask
-for (int i = 0; i < 8; ++i) {
-    bool has_piece = (packed_byte & (1 << (7 - i))) != 0;
-}
+---
+
+## ⚡ Full Execution & Deployment Guide — 3-Node Cooperative Swarm Test
+
+This walks through running two seeders and one leecher locally, with the dashboard watching all three.
+
+### 1. Compile the C++ binary (Visual Studio)
+
+1. Open the project folder in Visual Studio as a CMake or `.sln` project (whichever your workspace uses).
+2. Set the solution configuration to **x64** and either **Debug** or **Release**.
+3. Build the solution (`Ctrl+Shift+B`). Confirm `p2p_core.exe` (or your configured output name) lands in `x64/Debug/` or `x64/Release/`.
+4. `main.cpp` reads from `source_asset.txt` if it exists in the working directory (falls back to synthetic placeholder data if the file is missing) — drop any 6000-byte-or-smaller test file named `source_asset.txt` next to the executable if you want to test with real content.
+
+### 2. Set up the Python dashboard
+
+```bash
+cd dashboard
+pip install streamlit pandas
+streamlit run dashboard.py
 ```
 
-The effect compounds fast. A 12-piece file, which would take 12 bytes as a naive boolean array, needs two bytes packed — one for pieces 0 through 7, a second (partially used) for pieces 8 through 11. The receiver runs the unpacking loop against each byte and rebuilds the full piece-status vector it needs for the exchange logic in Section 5.
+This opens a browser tab (default `http://localhost:8501`). Leave it running for the rest of the test — it's the shared observer for all three nodes.
+
+### 3. Launch the three swarm nodes
+
+Open three separate terminals, each running the compiled binary.
+
+**Terminal 1 — Seeder A**
+```
+Enter Local Peer ID: 2002
+Enter Local Port to BIND: 9999
+How many neighbors are you connecting to? 1
+ -> Enter target neighbor port #1: 7777
+```
+
+**Terminal 2 — Seeder B**
+```
+Enter Local Peer ID: 2003
+Enter Local Port to BIND: 8888
+How many neighbors are you connecting to? 1
+ -> Enter target neighbor port #1: 7777
+```
+
+**Terminal 3 — Leecher**
+```
+Enter Local Peer ID: 1001
+Enter Local Port to BIND: 7777
+How many neighbors are you connecting to? 2
+ -> Enter target neighbor port #1: 9999
+ -> Enter target neighbor port #2: 8888
+```
+
+Peer IDs `2002` and `2003` are hardcoded in `main.cpp` as the seeding condition — those two nodes preload pieces `0–2` and `3–5` respectively from `source_asset.txt` before the swarm starts. Any other Peer ID starts empty, which is why the leecher above uses `1001`.
+
+### 4. Trigger the handshake
+
+Each terminal is running a live keypress loop. With the **Leecher terminal focused**, press:
+
+- **`h`** — broadcasts a `SYN` handshake to every neighbor port entered at startup. Do this on the leecher first so it discovers both seeders.
+- **`t`** — sends a `FIN` teardown notice to every currently connected peer, cleanly closing those sessions.
+- **`q`** — stops the node and exits.
+
+### 5. What to expect
+
+- Console output on the seeders will show incoming `SYN` packets and outgoing `SYN_ACK` replies.
+- The leecher's console will show `DATA` requests going out, `ACK` confirmations coming back, and pieces filling in.
+- In the browser: the six-piece grid under **Distributed Bitfield Progress Map** should move from `⬛ Empty` to `⏳ Fetching` to `🟩 Active` as pieces land, and the **Connected Active Peer Node Matrix** table should populate with both seeder ports once the handshake completes. Remember the byte-count columns in that table are currently mislabeled per the `ChokeManager` note above — the numbers are real, but "Downloaded" and "Uploaded" are swapped from the leecher's actual perspective.
+- Once all six pieces show `Completed`, check the leecher's working directory for `peer_1001_storage.bin` — it should be byte-identical to `source_asset.txt` (or the synthetic fallback pattern if no source file was provided).
 
 ---
 
-## 5. The Data Exchange Pipeline — `PeerSessionManager`
+## License
 
-Once two peers have shaken hands and swapped bitfields, `PeerSessionManager` takes over. Its job is a straightforward loop: compare what this node is missing against what the connected neighbor's decoded bitfield says they have, and go get whatever overlaps.
-
-The exchange, step by step:
-
-1. **Gap detection.** The local node scans its own piece-completion vector against the neighbor's decoded bitfield, looking for any index where the local node is missing a piece the neighbor holds.
-2. **Request.** For each gap found, the node sends a `DATA` packet with an empty payload and the `Sequence` field set to the missing piece's index. The empty payload is what signals "this is a request," not a delivery — the same `PacketType` covers both directions.
-3. **Lookup and read.** The remote peer receives the request, computes the byte offset directly from the index (`index * piece_size`), and reads that exact slice out of its local data buffer.
-4. **Delivery.** That data gets packed into a new `DATA` packet — same type, now with the payload actually populated — and sent back to the requester.
-5. **Validation.** The requesting node checks the checksum on the returned packet. If it's clean, the piece is marked complete in the local `PieceManager`, the local bitfield is updated to reflect it, and an `ACK` packet goes back to the sender as a receipt.
-
-That five-step loop, repeated against every connected peer, is the entire mechanism by which a file assembles itself across the swarm — no single peer needs to hold the complete file for any other peer to eventually get one.
-
----
-
-## 6. Build Log — Phases 1 Through 10
-
-The project was built in the following order. Each phase is a working, testable increment on top of the last.
-
-**Phase 1 — Problem definition and architecture.** Decided on a symmetrical mesh model over a client-server model, and settled on raw UDP as the transport, accepting that reliability would need to be built by hand in exchange for full control over the wire format.
-
-**Phase 2 — `Packet` structure design.** Defined the fixed nine-byte header (`Type`, `Sequence`, `Length`, `Checksum`) described in Section 3, along with the five `PacketType` values the rest of the system builds on.
-
-**Phase 3 — Checksum and integrity validation.** Implemented the checksum calculation run on every outbound frame, and the corresponding re-check and discard-on-mismatch logic on the receiving side.
-
-**Phase 4 — Raw socket transport.** Wired up the actual UDP socket calls — binding, sending, and the blocking `recvfrom()` — and built the serialization/deserialization functions that convert between a `Packet` struct and the raw bytes that go over the wire.
-
-**Phase 5 — `SocketManager` and the threading split.** Split networking into the Background Listener Thread and Main Application Thread described in Section 4.3, connected by a thread-safe frame queue, so the socket read no longer blocks the rest of the application.
-
-**Phase 6 — `PieceManager` and file chunking.** Built the subsystem that slices a target file into uniform 1000-byte pieces and tracks, per piece, whether the local node has it yet.
-
-**Phase 7 — `HandshakeManager` and the `SYN` / `SYN_ACK` sequence.** Implemented the magic-string handshake and the connection-drop behavior for anything that fails it, as described in Section 4.1 and 4.2.
-
-**Phase 8 — Bitwise bitfield compression.** Added the packing and unpacking logic from Section 4.4, so file maps travel as packed bytes instead of raw boolean vectors.
-
-**Phase 9 — `PeerSessionManager` and the exchange loop.** Built the gap-detection, request, lookup, delivery, and validation cycle from Section 5, which is what actually moves piece data between two connected peers.
-
-**Phase 10 — End-to-end integration testing.** Ran two local instances of the engine against each other over loopback UDP, confirmed a full handshake, bitfield exchange, and complete piece-by-piece file reconstruction from one peer to the other.
-
----
-
-## 7. Architectural Next Steps
-
-Four critical upgrades are next in line to scale the core engine into an industrial-grade, swarm-resilient file distribution ecosystem:
-
-### A. Multi-Peer Swarm Scaling Engine
-We are upgrading the node architecture from a simple 1-on-1 pipeline to a concurrent, multi-connected mesh network. Instead of managing a single active connection, the core will track an array of multiple active peer sessions simultaneously. The network engine will route incoming data packets by their unique IP and port combinations, allowing a single leecher to pull different file pieces from 3, 4, or more neighbors at the exact same time.
-
-### B. Swarm-Aware Rarest-First Piece Selection
-Right now, our core engine can prioritize pieces based on local gaps, but its true power unlocks in a multi-peer swarm. By collecting the compressed file maps (bitfields) of all connected neighbors simultaneously, the selector will calculate the absolute rarest pieces across the entire active network. It will force the download queue to fetch those low-frequency pieces first, ensuring data doesn't get bottlenecked if a rare seeder suddenly goes offline.
-
-### C. Game-Theoretic Choke & Unchoke (Tit-for-Tat)
-To prevent "free-riders" (nodes that download data but refuse to upload any of their own), we are building a network throttling matrix. Every peer will actively track its upload-to-download ratio with its neighbors. If a neighbor stops sharing data back, our engine will send a `CHOKE` packet to temporarily halt their downloads, dynamically releasing the choke with an `UNCHOKE` flag only when cooperative balance is restored.
-
-### D. Real Physical Asset Serialization
-We are transitioning the engine from transferring simulated byte patterns to synchronizing actual files on your hard drive (like images, documents, or ZIP files). A small utility will read any physical asset, chop it into actual binary chunks, distribute it raw over the multi-threaded UDP pipeline, and use our disk persistence layer to perfectly reconstruct the original file on the receiving side.
-
-### Symmetrical Session Teardown — the `FIN` State Machine
-
-`FIN` already exists as a defined `PacketType`, but nothing currently sends or handles it — sessions just end when a socket goes idle. That's a problem: a peer that vanishes without notice leaves its neighbors holding an open connection that never gets cleaned up, tying up sockets and memory for a session that's already over. The teardown state machine gives `FIN` an actual job: when a peer intends to disconnect, it sends `FIN` to every connected neighbor first, those neighbors acknowledge and release their side of the session cleanly, and only then does the connection actually close. It's a small addition, but it's the difference between a swarm that degrades gracefully as peers come and go and one that slowly accumulates dead connections.
-
----
-
-## 8. Requirements
-
-- C++17-compatible compiler (tested with GCC and Clang)
-- POSIX sockets (Linux/macOS) — Windows support would require swapping in Winsock
-- No external dependencies beyond the standard library
-
-## 9. License
-
-MIT License — see [`LICENSE`](./LICENSE) for the full text. In short: use it, modify it, ship it, just keep the copyright notice attached.
+MIT License — see [`LICENSE`](./LICENSE) for the full text.
