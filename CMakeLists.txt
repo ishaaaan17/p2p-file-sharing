@@ -12,4 +12,5 @@ add_executable(p2p_app
     src/packet.cpp
     src/reliable_socket.cpp
     src/socket_manager.cpp
- "include/socket_manager.h" "src/socket_manager.cpp")
+    src/piece_manager.cpp
+ "include/socket_manager.h" "src/socket_manager.cpp" "include/piece_manager.h" "src/piece_manager.cpp")

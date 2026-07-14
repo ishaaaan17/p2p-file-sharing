@@ -1,68 +1,76 @@
 #include <iostream>
-#include <cstring>
+#include <vector>
 #include <string>
-#include "packet.h"
-#include "socket_manager.h"
+#include "piece_manager.h"
+
+void print_current_bitfield(const std::vector<bool>& bitfield) {
+    std::cout << "   Current Bitfield Map: [";
+    for (bool bit : bitfield) {
+        std::cout << (bit ? "1" : "0");
+    }
+    std::cout << "]" << std::endl;
+}
 
 int main() {
-    std::cout << "[P2P Architecture Engine] Testing SocketManager Orchestration Layer..." << std::endl;
+    std::cout << "[P2P Storage Engine] Testing PieceManager Slicing & State Mechanics..." << std::endl;
 
-    // 1. Instantiate the high-level manager
-    P2P::SocketManager manager;
+    // 1. Instantiate the piece manager
+    P2P::PieceManager piece_mgr;
 
-    // 2. Start the network node on our test port 8888
-    uint16_t port = 8888;
-    if (!manager.start(port)) {
-        std::cerr << "CRITICAL: Failed to start the Socket Manager node instance." << std::endl;
-        return -1;
+    // 2. Simulate a non-divisible uneven file layout (e.g., a 10.5 MB video file)
+    // 11,000,000 bytes divided into standard 2,000,000 byte (2 MB) chunks
+    uint64_t mock_file_size = 11000000;
+    uint32_t mock_piece_size = 2000000;
+
+    std::cout << "\n--- Initializing File Structural Layout ---" << std::endl;
+    piece_mgr.initialize_file_layout("D:\\downloads\\ubuntu_distribution_mock.iso", mock_file_size, mock_piece_size);
+
+    // Verify chunk budget numbers match our engineering design expectations
+    std::vector<bool> current_map = piece_mgr.get_bitfield();
+    print_current_bitfield(current_map);
+    std::cout << "   Missing Pieces remaining: " << piece_mgr.get_missing_pieces_count() << std::endl;
+
+    // 3. Simulate down-streaming out-of-order P2P chunks landing randomly from distinct peers
+    std::cout << "\n--- Simulating Out-of-Order P2P Fragment Capture ---" << std::endl;
+
+    // Peer A drops piece index 1
+    std::cout << " -> Capture event: Packet chunk for Piece #1 arrived." << std::endl;
+    piece_mgr.mark_piece_complete(1);
+
+    // Peer B drops piece index 4
+    std::cout << " -> Capture event: Packet chunk for Piece #4 arrived." << std::endl;
+    piece_mgr.mark_piece_complete(4);
+
+    // Peer C drops piece index 0
+    std::cout << " -> Capture event: Packet chunk for Piece #0 arrived." << std::endl;
+    piece_mgr.mark_piece_complete(0);
+
+    // 4. Inspect intermediate bitfield representation status
+    std::cout << "\n--- Inspecting Intermediate Pipeline State ---" << std::endl;
+    current_map = piece_mgr.get_bitfield();
+    print_current_bitfield(current_map);
+    std::cout << "   Missing Pieces remaining: " << piece_mgr.get_missing_pieces_count() << std::endl;
+    std::cout << "   Is total file download complete? " << (piece_mgr.is_file_complete() ? "YES" : "NO") << std::endl;
+
+    // 5. Complete remaining structural slices to simulate full asset assembly
+    std::cout << "\n--- Downloading Remaining Missing Targets ---" << std::endl;
+    piece_mgr.mark_piece_complete(2);
+    piece_mgr.mark_piece_complete(3);
+    piece_mgr.mark_piece_complete(5); // The tail piece block!
+
+    // 6. Final verification checks
+    std::cout << "\n--- Final Storage Assembly Report ---" << std::endl;
+    current_map = piece_mgr.get_bitfield();
+    print_current_bitfield(current_map);
+    std::cout << "   Missing Pieces remaining: " << piece_mgr.get_missing_pieces_count() << std::endl;
+    std::cout << "   Is total file download complete? " << (piece_mgr.is_file_complete() ? "YES" : "NO") << std::endl;
+
+    if (piece_mgr.is_file_complete()) {
+        std::cout << "\n[SUCCESS] Storage bitfield tracking system operational and memory-safe." << std::endl;
     }
-
-    // 3. Construct an abstraction test packet
-    P2P::Packet outbound_pkt;
-    outbound_pkt.type = P2P::PacketType::DATA;
-    outbound_pkt.seq_num = 42; // Testing a new sequence state
-
-    const char* manager_message = "Socket Manager Architecture: Fully Operational.";
-    outbound_pkt.data_len = static_cast<uint16_t>(std::strlen(manager_message));
-    std::memcpy(outbound_pkt.payload, manager_message, outbound_pkt.data_len);
-    outbound_pkt.checksum = outbound_pkt.calculate_checksum();
-
-    // 4. Send the data to ourselves via the loopback address through the manager interface
-    std::string loopback_ip = "127.0.0.1";
-    std::cout << " -> Routing transmission out through Manager interface..." << std::endl;
-    if (!manager.send_data_to(outbound_pkt, loopback_ip, port)) {
-        std::cerr << "Manager transmission dispatch failure!" << std::endl;
-        return -1;
+    else {
+        std::cout << "\n[FAILURE] Allocation state mapping fault." << std::endl;
     }
-
-    // 5. Poll for the incoming loopback packet rebound
-    std::cout << " -> Polling manager for inbound network frames..." << std::endl;
-    P2P::Packet inbound_pkt;
-    std::string sender_ip;
-    uint16_t sender_port = 0;
-
-    if (manager.poll_incoming_traffic(inbound_pkt, sender_ip, sender_port)) {
-        std::cout << "\n[ORCHESTRATION SUCCESS] Frame retrieved from SocketManager pipeline!" << std::endl;
-        std::cout << "   Peer Address: " << sender_ip << ":" << sender_port << std::endl;
-        std::cout << "   Sequence ID:  " << inbound_pkt.seq_num << std::endl;
-
-        // Securely unpack and display string payload bytes
-        char clean_string[P2P::MAX_PAYLOAD_SIZE + 1] = { 0 };
-        std::memcpy(clean_string, inbound_pkt.payload, inbound_pkt.data_len);
-        std::cout << "   Payload:      \"" << clean_string << "\"" << std::endl;
-
-        // Perform mathematical safety integrity validation
-        if (inbound_pkt.calculate_checksum() == inbound_pkt.checksum) {
-            std::cout << "   Data Status:  PASSED (No bit corruption)" << std::endl;
-        }
-        else {
-            std::cout << "   Data Status:  FAILED (Bit corruption detected)" << std::endl;
-        }
-    }
-
-    // 6. Tear down the subsystem using the manager control path
-    manager.stop();
-    std::cout << "\n[Engine Test Closed] Manager shut down cleanly. Stack components recycled." << std::endl;
 
     return 0;
 }
