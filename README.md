@@ -168,15 +168,19 @@ The project was built in the following order. Each phase is a working, testable 
 
 ## 7. Architectural Next Steps
 
-Three upgrades are next in line, each targeting a specific gap between "works on a local test" and "holds up under real swarm conditions."
+Four critical upgrades are next in line to scale the core engine into an industrial-grade, swarm-resilient file distribution ecosystem:
 
-### Rarest-First Piece Selection
+### A. Multi-Peer Swarm Scaling Engine
+We are upgrading the node architecture from a simple 1-on-1 pipeline to a concurrent, multi-connected mesh network. Instead of managing a single active connection, the core will track an array of multiple active peer sessions simultaneously. The network engine will route incoming data packets by their unique IP and port combinations, allowing a single leecher to pull different file pieces from 3, 4, or more neighbors at the exact same time.
 
-Right now, gap detection just walks the missing-pieces list in order. That's fine with two peers, but in a swarm with many peers it creates a real risk: if everyone happens to download the same early pieces first, the *last* pieces of a file can end up held by only one or two peers total — and if either of them drops offline, that piece becomes unavailable to the whole swarm. Rarest-first selection fixes this by tracking, across every connected peer's bitfield, how many copies of each piece currently exist in the visible swarm, and prioritizing requests for whichever pieces have the fewest holders. The effect is a more even distribution of data across all peers, which keeps the swarm resilient even as individual nodes come and go.
+### B. Swarm-Aware Rarest-First Piece Selection
+Right now, our core engine can prioritize pieces based on local gaps, but its true power unlocks in a multi-peer swarm. By collecting the compressed file maps (bitfields) of all connected neighbors simultaneously, the selector will calculate the absolute rarest pieces across the entire active network. It will force the download queue to fetch those low-frequency pieces first, ensuring data doesn't get bottlenecked if a rare seeder suddenly goes offline.
 
-### High-Performance Disk Persistence
+### C. Game-Theoretic Choke & Unchoke (Tit-for-Tat)
+To prevent "free-riders" (nodes that download data but refuse to upload any of their own), we are building a network throttling matrix. Every peer will actively track its upload-to-download ratio with its neighbors. If a neighbor stops sharing data back, our engine will send a `CHOKE` packet to temporarily halt their downloads, dynamically releasing the choke with an `UNCHOKE` flag only when cooperative balance is restored.
 
-The current implementation holds piece data in memory buffers, which is fine for testing but means the whole download evaporates if the process restarts, and caps file size at whatever fits in RAM. The next step swaps that out for real binary file streams using `std::fstream`, with `seekp()` used to jump directly to the correct byte offset for a given piece index and write it straight to disk. That makes downloads persistent across restarts and removes the in-memory size ceiling entirely — a piece can be written to its exact position on disk the moment it's validated, with no need to hold the rest of the file in memory at the same time.
+### D. Real Physical Asset Serialization
+We are transitioning the engine from transferring simulated byte patterns to synchronizing actual files on your hard drive (like images, documents, or ZIP files). A small utility will read any physical asset, chop it into actual binary chunks, distribute it raw over the multi-threaded UDP pipeline, and use our disk persistence layer to perfectly reconstruct the original file on the receiving side.
 
 ### Symmetrical Session Teardown — the `FIN` State Machine
 
