@@ -24,11 +24,14 @@ namespace P2P {
         HandshakeManager(uint32_t local_id);
         ~HandshakeManager();
 
-        // Generates an initialization frame utilizing PacketType::SYN
         Packet prepare_handshake_packet() const;
-
-        // Validates the protocol identity credentials
         bool process_incoming_handshake(const Packet& packet, uint32_t& out_remote_peer_id);
+
+        // NEW Phase 8: Creates a SYN_ACK frame containing the packed bitfield map
+        Packet prepare_syn_ack_packet(const std::vector<bool>& local_bitfield) const;
+
+        // NEW Phase 8: Parses an incoming SYN_ACK packet to extract the peer's bitfield map
+        bool process_incoming_syn_ack(const Packet& packet, std::vector<bool>& out_remote_bitfield, uint32_t total_pieces);
 
         HandshakeState get_state() const { return m_current_state; }
         void set_state(HandshakeState new_state) { m_current_state = new_state; }
