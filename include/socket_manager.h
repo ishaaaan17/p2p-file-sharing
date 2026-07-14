@@ -1,57 +1,69 @@
 #pragma once
-#include <memory>
-#include <vector>
 #include <string>
-#include <thread>
-#include <mutex>
-#include <atomic>
 #include <queue>
-#include "reliable_socket.h"
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <atomic>
+#include <cstdint>
 #include "packet.h"
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#endif
 
 namespace P2P {
 
-    // A simple struct to wrap a packet along with its source networking metadata
+    // A structural representation of a remote network endpoint
+    struct PeerEndpoint {
+        std::string ip;
+        uint16_t port;
+
+        bool operator==(const PeerEndpoint& other) const {
+            return ip == other.ip && port == other.port;
+        }
+    };
+
+    // A combined container that moves across our multi-threaded queue pipeline
     struct InboundNetworkFrame {
         Packet packet;
-        std::string sender_ip;
-        uint16_t sender_port;
+        PeerEndpoint endpoint;
     };
 
     class SocketManager {
     private:
-        std::unique_ptr<ReliableSocket> m_listening_socket;
-        uint16_t m_current_port;
-
-        // Thread Safety and Asynchronous Mechanics
+#ifdef _WIN32
+        SOCKET m_socket;
+#else
+        int m_socket;
+#endif
         std::atomic<bool> m_is_running;
-        std::thread m_worker_thread;
+        std::thread m_listener_thread;
+
+        // Thread-safe pipeline components updated for multi-peer frames
+        std::queue<InboundNetworkFrame> m_frame_queue;
         std::mutex m_queue_mutex;
 
-        // Internal storage thread-safe FIFO queue for packets waiting to be processed
-        std::queue<InboundNetworkFrame> m_inbound_queue;
-
-        // The background loop executed by our worker thread
-        void network_worker_loop();
+        void listen_loop();
 
     public:
         SocketManager();
         ~SocketManager();
 
-        // Starts up the centralized network node and spawns the background worker thread
         bool start(uint16_t port);
-
-        // Dispatches a packet to a specified endpoint asynchronously
-        bool send_data_to(const Packet& packet, const std::string& ip, uint16_t port);
-
-        // Checks our thread-safe queue for incoming traffic without blocking the main execution path
-        bool pop_incoming_frame(Packet& out_packet, std::string& out_ip, uint16_t& out_port);
-
-        // Safely stops the background worker thread and terminates handles cleanly
         void stop();
 
-        uint16_t get_port() const { return m_current_port; }
-        bool is_active() const { return m_is_running.load(); }
+        // Dispatches a packet out to a explicit remote network address
+        bool send_data_to(const Packet& packet, const std::string& target_ip, uint16_t target_port);
+
+        // Pops a tracking frame containing the data packet and the endpoint that sent it
+        bool pop_incoming_frame(Packet& out_packet, PeerEndpoint& out_endpoint);
     };
 
 } // namespace P2P
