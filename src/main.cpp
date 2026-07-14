@@ -6,7 +6,7 @@
 #include <thread>
 #include <memory>
 #include <map>
-#include <fstream> // Required for real asset synchronization streams
+#include <fstream>
 #include "packet.h"
 #include "socket_manager.h"
 #include "piece_manager.h"
@@ -21,9 +21,32 @@ struct SwarmPeerNode {
     std::unique_ptr<P2P::PeerSessionManager> session;
 };
 
+// --- TELEMETRY HELPER TO FEED THE PYTHON DASHBOARD ---
+void send_telemetry_to_dashboard(P2P::SocketManager& socket_mgr, const std::string& type, uint16_t port, uint64_t downloaded, uint64_t uploaded, const std::string& status, int32_t piece_idx = -1) {
+    std::string json_str;
+    if (type == "PEER_UPDATE") {
+        json_str = "{\"type\":\"PEER_UPDATE\",\"port\":" + std::to_string(port) +
+            ",\"downloaded\":" + std::to_string(downloaded) +
+            ",\"uploaded\":" + std::to_string(uploaded) +
+            ",\"status\":\"" + status + "\"}";
+    }
+    else if (type == "PIECE_UPDATE") {
+        json_str = "{\"type\":\"PIECE_UPDATE\",\"index\":" + std::to_string(piece_idx) +
+            ",\"status\":\"" + status + "\"}";
+    }
+
+    // Create a dummy packet payload to carry the text frame over our raw socket manager to localhost port 6000
+    P2P::Packet telemetry_pkt;
+    telemetry_pkt.type = P2P::PacketType::DATA;
+    telemetry_pkt.data_len = static_cast<uint16_t>(json_str.length());
+    std::memcpy(telemetry_pkt.payload, json_str.c_str(), json_str.length());
+
+    socket_mgr.send_data_to(telemetry_pkt, "127.0.0.1", 6000);
+}
+
 int main() {
     std::cout << "========================================================" << std::endl;
-    std::cout << "     FULL SWARM PRODUCTION DISTRIBUTION ENGINE CORE     " << std::endl;
+    std::cout << "     FULL SWARM CORE ENGINE WITH PYTHON VISUAL TELEMETRY " << std::endl;
     std::cout << "========================================================\n" << std::endl;
 
     uint32_t local_peer_id = 0;
@@ -53,6 +76,10 @@ int main() {
     std::string filename = "peer_" + std::to_string(local_peer_id) + "_storage.bin";
     piece_mgr.initialize_file_layout(filename, 6000, 1000);
 
+    // Track state metrics locally for telemetry aggregation
+    std::map<uint16_t, uint64_t> peer_uploaded_bytes;
+    std::map<uint16_t, uint64_t> peer_downloaded_bytes;
+
     // --- REAL ASSET SERIALIZATION ENGINE ---
     if (local_peer_id == 2002 || local_peer_id == 2003) {
         std::cout << "[Seeding Mode] Loading real file data streams into mesh memory..." << std::endl;
@@ -73,7 +100,6 @@ int main() {
                     std::memset(chunk + bytes_read, ' ', 1000 - bytes_read);
                 }
 
-                // Segment block ranges: 2002 tracks pieces 0-2, 2003 tracks pieces 3-5
                 if (i >= start_piece && i < end_piece) {
                     piece_mgr.write_piece_to_disk(i, chunk, 1000);
                 }
@@ -108,21 +134,24 @@ int main() {
         if (socket_mgr.pop_incoming_frame(inbound_pkt, sender_ep)) {
             uint16_t origin_port = sender_ep.port;
 
-            // --- GAME THEORY CHOKE EVALUATOR ENGINE ROUTINES ---
             if (inbound_pkt.type == P2P::PacketType::CHOKE) {
-                std::cout << "[GAME THEORY] Peer on Port " << origin_port << " has CHOKED us! Pipeline paused." << std::endl;
+                std::cout << "[GAME THEORY] Peer on Port " << origin_port << " has CHOKED us!" << std::endl;
+                send_telemetry_to_dashboard(socket_mgr, "PEER_UPDATE", origin_port, peer_downloaded_bytes[origin_port], peer_uploaded_bytes[origin_port], "CHOKED");
                 continue;
             }
             else if (inbound_pkt.type == P2P::PacketType::UNCHOKE) {
-                std::cout << "[GAME THEORY] Peer on Port " << origin_port << " has UNCHOKED us! Pipeline resumed." << std::endl;
+                std::cout << "[GAME THEORY] Peer on Port " << origin_port << " has UNCHOKED us!" << std::endl;
+                send_telemetry_to_dashboard(socket_mgr, "PEER_UPDATE", origin_port, peer_downloaded_bytes[origin_port], peer_uploaded_bytes[origin_port], "UNCHOKED");
             }
 
             if (inbound_pkt.type == P2P::PacketType::SYN) {
                 uint32_t remote_id = 0;
                 if (handshake_mgr.process_incoming_handshake(inbound_pkt, remote_id)) {
-                    std::cout << "[SWARM EVENT] Accepted valid SYN handshake from Port: " << origin_port << " (Peer #" << remote_id << ")" << std::endl;
+                    std::cout << "[SWARM EVENT] Accepted valid SYN handshake from Port: " << origin_port << std::endl;
                     P2P::Packet syn_ack = handshake_mgr.prepare_syn_ack_packet(piece_mgr.get_bitfield());
                     socket_mgr.send_data_to(syn_ack, sender_ep.ip, origin_port);
+
+                    send_telemetry_to_dashboard(socket_mgr, "PEER_UPDATE", origin_port, 0, 0, "UNCHOKED");
                 }
             }
             else if (inbound_pkt.type == P2P::PacketType::SYN_ACK) {
@@ -141,43 +170,51 @@ int main() {
                         global_swarm_bitfields.push_back(pair.second.session->get_remote_bitfield());
                     }
 
+                    send_telemetry_to_dashboard(socket_mgr, "PEER_UPDATE", origin_port, 0, 0, "UNCHOKED");
+
                     auto& current_node = active_swarm_nodes[origin_port];
                     int32_t rare_chunk = current_node.session->select_rarest_piece_to_request(piece_mgr, global_swarm_bitfields);
                     if (rare_chunk != -1) {
                         P2P::Packet req = current_node.session->create_piece_request(static_cast<uint32_t>(rare_chunk));
                         socket_mgr.send_data_to(req, sender_ep.ip, origin_port);
-                        std::cout << " -> [Multi-Rarest-First] Requesting Piece #" << rare_chunk << " from Port " << origin_port << std::endl;
+
+                        send_telemetry_to_dashboard(socket_mgr, "PIECE_UPDATE", 0, 0, 0, "Downloading", rare_chunk);
                     }
                 }
             }
             else if (inbound_pkt.type == P2P::PacketType::DATA) {
-                // Outbound flow - Remote node is pulling pieces out of our disk manager
                 if (inbound_pkt.data_len == 0 && active_swarm_nodes.count(origin_port)) {
-
                     if (choke_mgr.should_choke_peer(origin_port)) {
                         if (!choke_mgr.get_choke_status(origin_port)) {
-                            std::cout << "[ANTI-LEECH] Throttling Peer on Port " << origin_port << " due to zero uploads. Sending CHOKE." << std::endl;
                             P2P::Packet choke_pkt;
                             choke_pkt.type = P2P::PacketType::CHOKE;
                             socket_mgr.send_data_to(choke_pkt, sender_ep.ip, origin_port);
                             choke_mgr.set_choke_status(origin_port, true);
+                            send_telemetry_to_dashboard(socket_mgr, "PEER_UPDATE", origin_port, peer_downloaded_bytes[origin_port], peer_uploaded_bytes[origin_port], "CHOKED");
                         }
                         continue;
                     }
 
                     P2P::Packet resp = active_swarm_nodes[origin_port].session->fulfill_piece_request_from_disk(inbound_pkt, piece_mgr);
                     socket_mgr.send_data_to(resp, sender_ep.ip, origin_port);
+
                     choke_mgr.record_download(origin_port, resp.data_len);
+                    peer_downloaded_bytes[origin_port] += resp.data_len;
+
+                    send_telemetry_to_dashboard(socket_mgr, "PEER_UPDATE", origin_port, peer_downloaded_bytes[origin_port], peer_uploaded_bytes[origin_port], "UNCHOKED");
                 }
-                // Inbound flow - Remote node returned real data pieces to us
                 else if (inbound_pkt.data_len > 0 && active_swarm_nodes.count(origin_port)) {
                     auto& current_node = active_swarm_nodes[origin_port];
                     if (current_node.session->verify_and_process_incoming_block(inbound_pkt, inbound_pkt.seq_num)) {
 
                         piece_mgr.write_piece_to_disk(inbound_pkt.seq_num, inbound_pkt.payload, inbound_pkt.data_len);
                         choke_mgr.record_upload(origin_port, inbound_pkt.data_len);
+                        peer_uploaded_bytes[origin_port] += inbound_pkt.data_len;
 
-                        std::cout << "[DISK WRITE] Successfully saved Piece #" << inbound_pkt.seq_num << " sent by Port " << origin_port << std::endl;
+                        std::cout << "[DISK WRITE] Successfully saved Piece #" << inbound_pkt.seq_num << std::endl;
+
+                        send_telemetry_to_dashboard(socket_mgr, "PIECE_UPDATE", 0, 0, 0, "Completed", inbound_pkt.seq_num);
+                        send_telemetry_to_dashboard(socket_mgr, "PEER_UPDATE", origin_port, peer_downloaded_bytes[origin_port], peer_uploaded_bytes[origin_port], "UNCHOKED");
 
                         P2P::Packet ack = current_node.session->create_acknowledgement(inbound_pkt.seq_num);
                         socket_mgr.send_data_to(ack, sender_ep.ip, origin_port);
@@ -197,6 +234,7 @@ int main() {
                         if (next_chunk != -1) {
                             P2P::Packet req = active_swarm_nodes[chosen_port].session->create_piece_request(static_cast<uint32_t>(next_chunk));
                             socket_mgr.send_data_to(req, active_swarm_nodes[chosen_port].endpoint.ip, chosen_port);
+                            send_telemetry_to_dashboard(socket_mgr, "PIECE_UPDATE", 0, 0, 0, "Downloading", next_chunk);
                         }
                         else {
                             std::cout << "\n========================================================" << std::endl;
@@ -214,7 +252,7 @@ int main() {
 
 #ifdef _WIN32
         if (getkey_check_async('h')) {
-            std::cout << "\n[Action] Broadcasting SYN handshakes across target swarm ports..." << std::endl;
+            std::cout << "\n[Action] Broadcasting SYN handshakes..." << std::endl;
             for (uint16_t target_port : swarm_targets) {
                 P2P::Packet syn_pkt = handshake_mgr.prepare_handshake_packet();
                 socket_mgr.send_data_to(syn_pkt, "127.0.0.1", target_port);
