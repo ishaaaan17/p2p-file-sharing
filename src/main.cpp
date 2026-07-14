@@ -1,62 +1,84 @@
 #include <iostream>
 #include <vector>
-#include "handshake_manager.h"
+#include <string>
+#include <cstring>
+#include "piece_manager.h"
+#include "peer_session_manager.h"
 #include "packet.h"
 
-void print_bitfield_vector(const std::string& label, const std::vector<bool>& bitfield) {
+void print_bool_vector(const std::string& label, const std::vector<bool>& vec) {
     std::cout << "   " << label << ": [";
-    for (bool bit : bitfield) {
+    for (bool bit : vec) {
         std::cout << (bit ? "1" : "0");
     }
     std::cout << "]" << std::endl;
 }
 
 int main() {
-    std::cout << "[P2P Protocol Engine] Simulating Full SYN -> SYN_ACK Bitfield Exchange Pipeline...\n" << std::endl;
+    std::cout << "[P2P Exchange Engine] Simulating Request-Response Block Data Loop...\n" << std::endl;
 
-    // 1. Setup local and remote managers
-    P2P::HandshakeManager local_node(1001);
-    P2P::HandshakeManager remote_node(2002);
+    // 1. Setup our local PieceManager 
+    // Passing a mock file path string first, followed by total size (6000) and piece size (1000)
+    P2P::PieceManager local_piece_mgr;
+    local_piece_mgr.initialize_file_layout("mock_download.dat", 6000, 1000);
 
-    // 2. Define a mock file map layout (12 pieces)
-    // Let's assume the remote peer has pieces: 0, 1, 3, 4, 7, 9, 11
-    std::vector<bool> remote_mock_bitfield = { true, true, false, true, true, false, false, true, false, true, false, true };
-    uint32_t total_pieces = static_cast<uint32_t>(remote_mock_bitfield.size());
+    // 2. Setup the remote peer's decoded map from the handshake phase
+    std::vector<bool> remote_peer_map = { true, true, true, true, true, true };
+    P2P::PeerSessionManager session(2002, remote_peer_map);
 
-    print_bitfield_vector("Original Remote Bitfield Map", remote_mock_bitfield);
-    std::cout << "   Total system bits to transmit: " << total_pieces << " bits." << std::endl;
+    // 3. Generate a simulated 6,000-byte disk data buffer for the remote peer
+    std::vector<uint8_t> remote_mock_disk(6000);
+    for (size_t i = 0; i < remote_mock_disk.size(); ++i) {
+        remote_mock_disk[i] = static_cast<uint8_t>('A' + (i / 1000));
+    }
 
-    // 3. Remote Node serializes its bitfield into a SYN_ACK packet
-    std::cout << "\n--- Step 1: Remote Node Compressing Bitfield into Payload ---" << std::endl;
-    P2P::Packet syn_ack_pkt = remote_node.prepare_syn_ack_packet(remote_mock_bitfield);
-    std::cout << " -> SYN_ACK Frame Prepared. Type ID: " << static_cast<int>(syn_ack_pkt.type) << std::endl;
-    std::cout << " -> Compressed Data Payload Size: " << syn_ack_pkt.data_len << " bytes." << std::endl;
+    std::cout << " -> Local tracking initialization complete. Missing pieces: "
+        << local_piece_mgr.get_missing_pieces_count() << std::endl;
 
-    // 4. Local Node receives the SYN_ACK over the network wire and deserializes it
-    std::cout << "\n--- Step 2: Local Node Unpacking Payload Bitwise Stream ---" << std::endl;
-    std::vector<bool> extracted_local_bitfield;
+    // 4. Run the selection strategy engine to target the next block
+    int32_t target_piece = session.select_next_piece_to_request(local_piece_mgr);
+    std::cout << " -> Strategy engine selected target piece index: " << target_piece << std::endl;
 
-    if (local_node.process_incoming_syn_ack(syn_ack_pkt, extracted_local_bitfield, total_pieces)) {
-        print_bitfield_vector("Decoded Extracted Bitfield Map", extracted_local_bitfield);
+    if (target_piece != -1) {
+        // 5. Local node generates the outbound piece request frame
+        std::cout << "\n--- Step 1: Local Node Issuing DATA Request Frame ---" << std::endl;
+        P2P::Packet request_pkt = session.create_piece_request(static_cast<uint32_t>(target_piece));
+        std::cout << " -> Request dispatched for Piece #" << request_pkt.seq_num
+            << " (Payload Size: " << request_pkt.data_len << " bytes)" << std::endl;
 
-        // Integrity Verification Check
-        bool integrity_pass = true;
-        for (size_t i = 0; i < total_pieces; ++i) {
-            if (remote_mock_bitfield[i] != extracted_local_bitfield[i]) {
-                integrity_pass = false;
-                break;
-            }
-        }
+        // 6. Remote peer intercepts request and pulls data from disk buffer
+        std::cout << "\n--- Step 2: Remote Peer Fulfilling Request From Disk Buffer ---" << std::endl;
+        uint32_t standard_piece_size = 1000;
+        P2P::Packet response_pkt = session.fulfill_piece_request(request_pkt, remote_mock_disk, standard_piece_size);
+        std::cout << " -> Response packed. Piece ID: " << response_pkt.seq_num
+            << " | Transmitting " << response_pkt.data_len << " bytes." << std::endl;
+        std::cout << " -> Data block preview character signature: '" << (char)response_pkt.payload[0] << "'" << std::endl;
 
-        if (integrity_pass) {
-            std::cout << "\n[SUCCESS] Bitfield packed, transmitted, and decompressed with 100% integrity!" << std::endl;
+        // 7. Local node intercepts response frame and runs validation checks
+        std::cout << "\n--- Step 3: Local Node Validating and Processing Inbound Block ---" << std::endl;
+        if (session.verify_and_process_incoming_block(response_pkt, static_cast<uint32_t>(target_piece))) {
+            std::cout << " -> Checksum validation PASSED." << std::endl;
+
+            // Mark the piece complete inside our manager layout
+            local_piece_mgr.mark_piece_complete(static_cast<uint32_t>(target_piece));
+
+            // Manually print the bitfield vector since get_bitfield_string doesn't exist
+            print_bool_vector(" -> Piece Manager bitfield updated", local_piece_mgr.get_bitfield());
+
+            // 8. Generate the confirmation ACK to complete the transaction loop
+            P2P::Packet ack_pkt = session.create_acknowledgement(static_cast<uint32_t>(target_piece));
+            std::cout << "\n--- Step 4: Dispatching Reliable Transaction ACK ---" << std::endl;
+            std::cout << " -> ACK frame built for sequence slot: " << ack_pkt.seq_num
+                << " | Type ID: " << static_cast<int>(ack_pkt.type) << std::endl;
+
+            std::cout << "\n[SUCCESS] End-to-end data pipeline exchange sequence fully operational!" << std::endl;
         }
         else {
-            std::cout << "\n[CRITICAL ERROR] Bitfield tracking array payload data corruption detected!" << std::endl;
+            std::cerr << " -> Verification check failed. Data block discarded." << std::endl;
         }
     }
     else {
-        std::cerr << "Failed to parse incoming SYN_ACK packet framework." << std::endl;
+        std::cout << "No missing blocks match peer capability." << std::endl;
     }
 
     return 0;

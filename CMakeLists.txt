@@ -14,4 +14,5 @@ add_executable(p2p_app
     src/socket_manager.cpp
     src/piece_manager.cpp
     src/handshake_manager.cpp
+    src/peer_session_manager.cpp
 )
