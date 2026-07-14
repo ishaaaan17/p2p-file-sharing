@@ -1,49 +1,68 @@
 #include <iostream>
 #include <cstring>
+#include <string>
 #include "packet.h"
+#include "socket_manager.h"
 
 int main() {
-    std::cout << "[P2P Testing Engine] Initializing Packet Binary Test..." << std::endl;
+    std::cout << "[P2P Architecture Engine] Testing SocketManager Orchestration Layer..." << std::endl;
 
-    // 1. Construct a mock DATA packet containing a test message
-    P2P::Packet original_pkt;
-    original_pkt.type = P2P::PacketType::DATA;
-    original_pkt.seq_num = 105; // Mock sequence number
+    // 1. Instantiate the high-level manager
+    P2P::SocketManager manager;
 
-    const char* sample_chunk = "Systems Engineering: Verifying raw byte states early.";
-    original_pkt.data_len = static_cast<uint16_t>(std::strlen(sample_chunk));
-    std::memcpy(original_pkt.payload, sample_chunk, original_pkt.data_len);
+    // 2. Start the network node on our test port 8888
+    uint16_t port = 8888;
+    if (!manager.start(port)) {
+        std::cerr << "CRITICAL: Failed to start the Socket Manager node instance." << std::endl;
+        return -1;
+    }
 
-    // Assign calculated checksum
-    original_pkt.checksum = original_pkt.calculate_checksum();
+    // 3. Construct an abstraction test packet
+    P2P::Packet outbound_pkt;
+    outbound_pkt.type = P2P::PacketType::DATA;
+    outbound_pkt.seq_num = 42; // Testing a new sequence state
 
-    // 2. Serialize: Flatten struct variables into a raw byte vector
-    std::vector<uint8_t> wire_data = original_pkt.serialize();
-    std::cout << " -> Total serialized packet size: " << wire_data.size() << " bytes." << std::endl;
+    const char* manager_message = "Socket Manager Architecture: Fully Operational.";
+    outbound_pkt.data_len = static_cast<uint16_t>(std::strlen(manager_message));
+    std::memcpy(outbound_pkt.payload, manager_message, outbound_pkt.data_len);
+    outbound_pkt.checksum = outbound_pkt.calculate_checksum();
 
-    // 3. Deserialize: Simulate receiving this raw stream back from a peer
-    try {
-        P2P::Packet unpacked_pkt = P2P::Packet::deserialize(wire_data.data(), wire_data.size());
+    // 4. Send the data to ourselves via the loopback address through the manager interface
+    std::string loopback_ip = "127.0.0.1";
+    std::cout << " -> Routing transmission out through Manager interface..." << std::endl;
+    if (!manager.send_data_to(outbound_pkt, loopback_ip, port)) {
+        std::cerr << "Manager transmission dispatch failure!" << std::endl;
+        return -1;
+    }
 
-        std::cout << " -> Unpacked Sequence Number: " << unpacked_pkt.seq_num << std::endl;
+    // 5. Poll for the incoming loopback packet rebound
+    std::cout << " -> Polling manager for inbound network frames..." << std::endl;
+    P2P::Packet inbound_pkt;
+    std::string sender_ip;
+    uint16_t sender_port = 0;
 
-        // Print and null-terminate the extracted payload string cleanly
-        char verification_string[P2P::MAX_PAYLOAD_SIZE + 1] = { 0 };
-        std::memcpy(verification_string, unpacked_pkt.payload, unpacked_pkt.data_len);
-        std::cout << " -> Unpacked Payload Data: \"" << verification_string << "\"" << std::endl;
+    if (manager.poll_incoming_traffic(inbound_pkt, sender_ip, sender_port)) {
+        std::cout << "\n[ORCHESTRATION SUCCESS] Frame retrieved from SocketManager pipeline!" << std::endl;
+        std::cout << "   Peer Address: " << sender_ip << ":" << sender_port << std::endl;
+        std::cout << "   Sequence ID:  " << inbound_pkt.seq_num << std::endl;
 
-        // Verify the mathematical fingerprint
-        if (unpacked_pkt.calculate_checksum() == unpacked_pkt.checksum) {
-            std::cout << "\n[SUCCESS] Custom Protocol Binary Layer verified error-free!" << std::endl;
+        // Securely unpack and display string payload bytes
+        char clean_string[P2P::MAX_PAYLOAD_SIZE + 1] = { 0 };
+        std::memcpy(clean_string, inbound_pkt.payload, inbound_pkt.data_len);
+        std::cout << "   Payload:      \"" << clean_string << "\"" << std::endl;
+
+        // Perform mathematical safety integrity validation
+        if (inbound_pkt.calculate_checksum() == inbound_pkt.checksum) {
+            std::cout << "   Data Status:  PASSED (No bit corruption)" << std::endl;
         }
         else {
-            std::cout << "\n[CRITICAL FAILURE] Checksum verification mismatch detected." << std::endl;
+            std::cout << "   Data Status:  FAILED (Bit corruption detected)" << std::endl;
         }
+    }
 
-    }
-    catch (const std::exception& ex) {
-        std::cerr << "Parsing Exception triggered: " << ex.what() << std::endl;
-    }
+    // 6. Tear down the subsystem using the manager control path
+    manager.stop();
+    std::cout << "\n[Engine Test Closed] Manager shut down cleanly. Stack components recycled." << std::endl;
 
     return 0;
 }
