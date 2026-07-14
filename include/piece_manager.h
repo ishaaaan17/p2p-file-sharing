@@ -1,44 +1,42 @@
 #pragma once
-#include <vector>
 #include <string>
+#include <vector>
+#include <fstream>
+#include <mutex>
 #include <cstdint>
 
 namespace P2P {
 
-    struct PieceInfo {
-        uint32_t index;
-        uint32_t size;
-        bool is_downloaded;
-        // In a later phase, we will add: std::vector<uint8_t> expected_hash;
-    };
-
     class PieceManager {
     private:
         std::string m_file_path;
-        uint64_t m_total_file_size;
+        uint32_t m_total_file_size;
         uint32_t m_piece_size;
         uint32_t m_total_pieces;
-        std::vector<PieceInfo> m_pieces;
+        std::vector<bool> m_bitfield;
+
+        // Thread safety mechanism to prevent multiple threads from writing to the disk simultaneously
+        mutable std::mutex m_disk_mutex;
 
     public:
         PieceManager();
         ~PieceManager();
 
-        // Configures the manager for a new tracking layout
-        void initialize_file_layout(const std::string& file_path, uint64_t file_size, uint32_t piece_size);
+        // Initializes file tracking arrays and allocates target empty binary files on disk
+        bool initialize_file_layout(const std::string& file_path, uint32_t total_size, uint32_t piece_size);
 
-        // Marks a specific piece chunk as verified and written to disk
-        void mark_piece_complete(uint32_t index);
+        // High-performance disk writer targeting direct byte positions
+        bool write_piece_to_disk(uint32_t piece_index, const uint8_t* payload_buffer, uint32_t payload_size);
 
-        // Generates a boolean bitfield array representation for peer exchange updates
+        // High-performance disk reader targeting direct byte positions for seeding
+        bool read_piece_from_disk(uint32_t piece_index, uint8_t* out_buffer, uint32_t& out_size) const;
+
+        void mark_piece_complete(uint32_t piece_index);
+
         std::vector<bool> get_bitfield() const;
-
-        // Validates whether the entire file transfer architecture is complete
-        bool is_file_complete() const;
-
-        // Accessor metrics for our download tracking layers
-        uint32_t get_total_pieces() const { return m_total_pieces; }
         uint32_t get_missing_pieces_count() const;
+        uint32_t get_total_pieces() const { return m_total_pieces; }
+        uint32_t get_piece_size() const { return m_piece_size; }
     };
 
 } // namespace P2P

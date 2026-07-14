@@ -1,6 +1,7 @@
 #include "peer_session_manager.h"
 #include <cstring>
 #include <iostream>
+#include <limits>
 
 namespace P2P {
 
@@ -10,52 +11,65 @@ namespace P2P {
 
     PeerSessionManager::~PeerSessionManager() {}
 
-    int32_t PeerSessionManager::select_next_piece_to_request(const PieceManager& local_piece_mgr) const {
+    int32_t PeerSessionManager::select_rarest_piece_to_request(
+        const PieceManager& local_piece_mgr,
+        const std::vector<std::vector<bool>>& global_swarm_bitfields
+    ) const {
         std::vector<bool> local_bitfield = local_piece_mgr.get_bitfield();
+        size_t num_pieces = local_bitfield.size();
 
-        // Strategy: Iterate through our missing chunks and match them against what the peer owns
-        for (size_t i = 0; i < local_bitfield.size(); ++i) {
-            // If the local node lacks the piece, but the remote node possesses it, select it!
-            if (!local_bitfield[i] && i < m_remote_bitfield.size() && m_remote_bitfield[i]) {
-                return static_cast<int32_t>(i);
+        std::vector<uint32_t> piece_frequencies(num_pieces, 0);
+
+        // Calculate the availability frequency of each piece within the active swarm
+        for (const auto& bitfield : global_swarm_bitfields) {
+            for (size_t i = 0; i < num_pieces && i < bitfield.size(); ++i) {
+                if (bitfield[i]) {
+                    piece_frequencies[i]++;
+                }
             }
         }
 
-        return -1; // No matching pieces available to request from this specific peer
+        int32_t targeted_index = -1;
+        uint32_t lowest_frequency = std::numeric_limits<uint32_t>::max();
+
+        // Rarest-First Strategy Core Selection Loop
+        for (size_t i = 0; i < num_pieces; ++i) {
+            // We only care about pieces we are missing, but this specific peer owns
+            if (!local_bitfield[i] && i < m_remote_bitfield.size() && m_remote_bitfield[i]) {
+                // Find the piece with the absolute minimum availability in the swarm
+                if (piece_frequencies[i] < lowest_frequency) {
+                    lowest_frequency = piece_frequencies[i];
+                    targeted_index = static_cast<int32_t>(i);
+                }
+            }
+        }
+
+        return targeted_index;
     }
 
     Packet PeerSessionManager::create_piece_request(uint32_t piece_index) const {
         Packet packet;
-        packet.type = PacketType::DATA; // Utilizing DATA flag to initiate the request pipeline
-        packet.seq_num = piece_index;   // Sequence number stores the requested piece index
-        packet.data_len = 0;            // Data length is 0 because there is no payload data yet
+        packet.type = PacketType::DATA;
+        packet.seq_num = piece_index;
+        packet.data_len = 0;
         packet.checksum = packet.calculate_checksum();
         return packet;
     }
 
-    Packet PeerSessionManager::fulfill_piece_request(const Packet& request_packet, const std::vector<uint8_t>& mock_disk_buffer, uint32_t piece_size) const {
+    Packet PeerSessionManager::fulfill_piece_request_from_disk(const Packet& request_packet, PieceManager& local_piece_mgr) const {
         Packet response_pkt;
         response_pkt.type = PacketType::DATA;
         response_pkt.seq_num = request_packet.seq_num;
 
         uint32_t piece_index = request_packet.seq_num;
-        size_t buffer_offset = static_cast<size_t>(piece_index) * piece_size;
+        uint32_t bytes_read = 0;
 
-        // Ensure we do not read past the boundaries of our data buffer
-        if (buffer_offset + piece_size <= mock_disk_buffer.size() && piece_size <= MAX_PAYLOAD_SIZE) {
-            std::memcpy(response_pkt.payload, mock_disk_buffer.data() + buffer_offset, piece_size);
-            response_pkt.data_len = static_cast<uint16_t>(piece_size);
+        // Production Layer: Stream straight out of physical storage disk via PieceManager
+        if (local_piece_mgr.read_piece_from_disk(piece_index, response_pkt.payload, bytes_read)) {
+            response_pkt.data_len = static_cast<uint16_t>(bytes_read);
         }
         else {
-            // Handle tail piece scenarios where the block size is shorter than standard pieces
-            size_t remaining_bytes = mock_disk_buffer.size() - buffer_offset;
-            if (remaining_bytes <= MAX_PAYLOAD_SIZE) {
-                std::memcpy(response_pkt.payload, mock_disk_buffer.data() + buffer_offset, remaining_bytes);
-                response_pkt.data_len = static_cast<uint16_t>(remaining_bytes);
-            }
-            else {
-                response_pkt.data_len = 0;
-            }
+            response_pkt.data_len = 0;
         }
 
         response_pkt.checksum = response_pkt.calculate_checksum();
@@ -63,30 +77,25 @@ namespace P2P {
     }
 
     bool PeerSessionManager::verify_and_process_incoming_block(const Packet& data_packet, uint32_t expected_index) const {
-        if (data_packet.type != PacketType::DATA) {
-            std::cerr << "[Session Error] Non-DATA frame dropped during collection loops." << std::endl;
-            return false;
-        }
-
-        if (data_packet.seq_num != expected_index) {
-            std::cerr << "[Session Error] Out of sync sequence block index matching mismatch." << std::endl;
-            return false;
-        }
-
-        // Run the mathematical checksum validation to protect against data corruption over the wire
-        uint16_t computed_checksum = data_packet.calculate_checksum();
-        if (data_packet.checksum != computed_checksum) {
-            std::cerr << "[Session Error] Checksum corruption detected! Frame isolated." << std::endl;
-            return false;
-        }
-
+        if (data_packet.type != PacketType::DATA) return false;
+        if (data_packet.seq_num != expected_index) return false;
+        if (data_packet.checksum != data_packet.calculate_checksum()) return false;
         return true;
     }
 
     Packet PeerSessionManager::create_acknowledgement(uint32_t piece_index) const {
         Packet packet;
-        packet.type = PacketType::ACK; // Utilizing ACK flag to signal reliable receipt
+        packet.type = PacketType::ACK;
         packet.seq_num = piece_index;
+        packet.data_len = 0;
+        packet.checksum = packet.calculate_checksum();
+        return packet;
+    }
+
+    Packet PeerSessionManager::create_teardown_notification() const {
+        Packet packet;
+        packet.type = PacketType::FIN; // Explicit grace close flag mapping
+        packet.seq_num = 0;
         packet.data_len = 0;
         packet.checksum = packet.calculate_checksum();
         return packet;
