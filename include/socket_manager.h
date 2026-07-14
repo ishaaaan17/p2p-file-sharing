@@ -22,8 +22,8 @@ namespace P2P {
 
     // A structural representation of a remote network endpoint
     struct PeerEndpoint {
-        std::string ip;
-        uint16_t port;
+        std::string ip = "";
+        uint16_t port = 0; // <-- Initialized to 0 by default
 
         bool operator==(const PeerEndpoint& other) const {
             return ip == other.ip && port == other.port;

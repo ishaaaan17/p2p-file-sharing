@@ -6,15 +6,16 @@
 #include <thread>
 #include <memory>
 #include <map>
+#include <fstream> // Required for real asset synchronization streams
 #include "packet.h"
 #include "socket_manager.h"
 #include "piece_manager.h"
 #include "handshake_manager.h"
 #include "peer_session_manager.h"
+#include "choke_manager.h"
 
 bool getkey_check_async(char key);
 
-// Internal utility class to track connected active peer metadata structures cleanly
 struct SwarmPeerNode {
     P2P::PeerEndpoint endpoint;
     std::unique_ptr<P2P::PeerSessionManager> session;
@@ -22,7 +23,7 @@ struct SwarmPeerNode {
 
 int main() {
     std::cout << "========================================================" << std::endl;
-    std::cout << "     MULTIPLE-PEER SCALED MESH SYNCHRONIZATION RUNNER   " << std::endl;
+    std::cout << "     FULL SWARM PRODUCTION DISTRIBUTION ENGINE CORE     " << std::endl;
     std::cout << "========================================================\n" << std::endl;
 
     uint32_t local_peer_id = 0;
@@ -33,7 +34,6 @@ int main() {
     std::cout << "Enter Local Port to BIND: ";
     std::cin >> local_port;
 
-    // Collect multiple target destination ports to demonstrate true swarm behaviors
     std::vector<uint16_t> swarm_targets;
     int choice_count = 0;
     std::cout << "How many neighbors are you connecting to? ";
@@ -48,20 +48,45 @@ int main() {
     P2P::SocketManager socket_mgr;
     P2P::HandshakeManager handshake_mgr(local_peer_id);
     P2P::PieceManager piece_mgr;
+    P2P::ChokeManager choke_mgr;
 
     std::string filename = "peer_" + std::to_string(local_peer_id) + "_storage.bin";
     piece_mgr.initialize_file_layout(filename, 6000, 1000);
 
-    // Seeder baseline configuration parameters setup routines
+    // --- REAL ASSET SERIALIZATION ENGINE ---
     if (local_peer_id == 2002 || local_peer_id == 2003) {
-        std::cout << "[Seeding Mode] Populating asset fragments on drive sectors..." << std::endl;
+        std::cout << "[Seeding Mode] Loading real file data streams into mesh memory..." << std::endl;
+
+        std::ifstream source_file("source_asset.txt", std::ios::binary);
         uint8_t chunk[1000];
-        // Split file pieces across seeders: 2002 holds pieces 0-2, 2003 holds 3-5
-        uint32_t start = (local_peer_id == 2002) ? 0 : 3;
-        uint32_t end = (local_peer_id == 2002) ? 3 : 6;
-        for (uint32_t i = start; i < end; ++i) {
-            std::memset(chunk, 'A' + i, 1000);
-            piece_mgr.write_piece_to_disk(i, chunk, 1000);
+
+        uint32_t start_piece = (local_peer_id == 2002) ? 0 : 3;
+        uint32_t end_piece = (local_peer_id == 2002) ? 3 : 6;
+
+        if (source_file.is_open()) {
+            for (uint32_t i = 0; i < 6; ++i) {
+                source_file.seekg(i * 1000);
+                source_file.read(reinterpret_cast<char*>(chunk), 1000);
+
+                std::streamsize bytes_read = source_file.gcount();
+                if (bytes_read < 1000) {
+                    std::memset(chunk + bytes_read, ' ', 1000 - bytes_read);
+                }
+
+                // Segment block ranges: 2002 tracks pieces 0-2, 2003 tracks pieces 3-5
+                if (i >= start_piece && i < end_piece) {
+                    piece_mgr.write_piece_to_disk(i, chunk, 1000);
+                }
+            }
+            source_file.close();
+            std::cout << " -> Successfully parsed 'source_asset.txt' into P2P pieces!" << std::endl;
+        }
+        else {
+            std::cout << " -> [Notice] 'source_asset.txt' not found. Falling back to structured string patterns." << std::endl;
+            for (uint32_t i = start_piece; i < end_piece; ++i) {
+                std::memset(chunk, 'A' + i, 1000);
+                piece_mgr.write_piece_to_disk(i, chunk, 1000);
+            }
         }
     }
 
@@ -70,12 +95,11 @@ int main() {
         return -1;
     }
 
-    // Advanced map tracking all connected peer sessions dynamically by port number
     std::map<uint16_t, SwarmPeerNode> active_swarm_nodes;
     std::vector<std::vector<bool>> global_swarm_bitfields;
     bool running = true;
 
-    std::cout << "\n -> Multi-Peer Core Live! Press 'h' to Handshake Swarm, 't' to exit via FIN grace code, 'q' to quit." << std::endl;
+    std::cout << "\n -> Complete Swarm Active! Press 'h' to Handshake Swarm, 't' to exit via FIN, 'q' to quit." << std::endl;
 
     P2P::Packet inbound_pkt;
     P2P::PeerEndpoint sender_ep;
@@ -83,6 +107,15 @@ int main() {
     while (running) {
         if (socket_mgr.pop_incoming_frame(inbound_pkt, sender_ep)) {
             uint16_t origin_port = sender_ep.port;
+
+            // --- GAME THEORY CHOKE EVALUATOR ENGINE ROUTINES ---
+            if (inbound_pkt.type == P2P::PacketType::CHOKE) {
+                std::cout << "[GAME THEORY] Peer on Port " << origin_port << " has CHOKED us! Pipeline paused." << std::endl;
+                continue;
+            }
+            else if (inbound_pkt.type == P2P::PacketType::UNCHOKE) {
+                std::cout << "[GAME THEORY] Peer on Port " << origin_port << " has UNCHOKED us! Pipeline resumed." << std::endl;
+            }
 
             if (inbound_pkt.type == P2P::PacketType::SYN) {
                 uint32_t remote_id = 0;
@@ -103,43 +136,55 @@ int main() {
 
                     active_swarm_nodes[origin_port] = std::move(node);
 
-                    // Rebuild master swarm matrices to optimize Rarest-First choices
                     global_swarm_bitfields.clear();
                     for (const auto& pair : active_swarm_nodes) {
                         global_swarm_bitfields.push_back(pair.second.session->get_remote_bitfield());
                     }
 
-                    // Poll rarest component target index metrics choice routines
                     auto& current_node = active_swarm_nodes[origin_port];
                     int32_t rare_chunk = current_node.session->select_rarest_piece_to_request(piece_mgr, global_swarm_bitfields);
                     if (rare_chunk != -1) {
                         P2P::Packet req = current_node.session->create_piece_request(static_cast<uint32_t>(rare_chunk));
                         socket_mgr.send_data_to(req, sender_ep.ip, origin_port);
-                        std::cout << " -> [Multi-Rarest-First] Requesting Piece #" << rare_chunk << " from Peer on Port " << origin_port << std::endl;
+                        std::cout << " -> [Multi-Rarest-First] Requesting Piece #" << rare_chunk << " from Port " << origin_port << std::endl;
                     }
                 }
             }
             else if (inbound_pkt.type == P2P::PacketType::DATA) {
+                // Outbound flow - Remote node is pulling pieces out of our disk manager
                 if (inbound_pkt.data_len == 0 && active_swarm_nodes.count(origin_port)) {
-                    // Pull block data out of drive to answer remote block query request
+
+                    if (choke_mgr.should_choke_peer(origin_port)) {
+                        if (!choke_mgr.get_choke_status(origin_port)) {
+                            std::cout << "[ANTI-LEECH] Throttling Peer on Port " << origin_port << " due to zero uploads. Sending CHOKE." << std::endl;
+                            P2P::Packet choke_pkt;
+                            choke_pkt.type = P2P::PacketType::CHOKE;
+                            socket_mgr.send_data_to(choke_pkt, sender_ep.ip, origin_port);
+                            choke_mgr.set_choke_status(origin_port, true);
+                        }
+                        continue;
+                    }
+
                     P2P::Packet resp = active_swarm_nodes[origin_port].session->fulfill_piece_request_from_disk(inbound_pkt, piece_mgr);
                     socket_mgr.send_data_to(resp, sender_ep.ip, origin_port);
+                    choke_mgr.record_download(origin_port, resp.data_len);
                 }
+                // Inbound flow - Remote node returned real data pieces to us
                 else if (inbound_pkt.data_len > 0 && active_swarm_nodes.count(origin_port)) {
                     auto& current_node = active_swarm_nodes[origin_port];
                     if (current_node.session->verify_and_process_incoming_block(inbound_pkt, inbound_pkt.seq_num)) {
 
                         piece_mgr.write_piece_to_disk(inbound_pkt.seq_num, inbound_pkt.payload, inbound_pkt.data_len);
+                        choke_mgr.record_upload(origin_port, inbound_pkt.data_len);
+
                         std::cout << "[DISK WRITE] Successfully saved Piece #" << inbound_pkt.seq_num << " sent by Port " << origin_port << std::endl;
 
                         P2P::Packet ack = current_node.session->create_acknowledgement(inbound_pkt.seq_num);
                         socket_mgr.send_data_to(ack, sender_ep.ip, origin_port);
 
-                        // Scan across alternative tracking structures to identify next target chunk choice
                         int32_t next_chunk = -1;
                         uint16_t chosen_port = origin_port;
 
-                        // Check all connected endpoints to locate the next missing chunk via rarest-first strategy
                         for (auto& pair : active_swarm_nodes) {
                             int32_t chunk_idx = pair.second.session->select_rarest_piece_to_request(piece_mgr, global_swarm_bitfields);
                             if (chunk_idx != -1) {
@@ -152,7 +197,6 @@ int main() {
                         if (next_chunk != -1) {
                             P2P::Packet req = active_swarm_nodes[chosen_port].session->create_piece_request(static_cast<uint32_t>(next_chunk));
                             socket_mgr.send_data_to(req, active_swarm_nodes[chosen_port].endpoint.ip, chosen_port);
-                            std::cout << " -> [Swarm Strategy] Requesting Piece #" << next_chunk << " from Peer on Port " << chosen_port << std::endl;
                         }
                         else {
                             std::cout << "\n========================================================" << std::endl;
@@ -163,7 +207,7 @@ int main() {
                 }
             }
             else if (inbound_pkt.type == P2P::PacketType::FIN) {
-                std::cout << "[SWARM TEARDOWN] Graceful FIN received from remote neighbor on Port: " << origin_port << std::endl;
+                std::cout << "[SWARM TEARDOWN] Graceful FIN received from Port: " << origin_port << std::endl;
                 active_swarm_nodes.erase(origin_port);
             }
         }

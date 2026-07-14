@@ -6,13 +6,14 @@ namespace P2P {
 
     // These values identify what type of message is being sent.
     enum class PacketType : uint8_t {
-        SYN = 1,     // Handshake: Initiate a connection
-        SYN_ACK = 2, // Handshake: Acknowledge a connection request
-        DATA = 3,    // File Transfer: Contains actual file pieces
-        ACK = 4,     // Reliability: Acknowledges received data pieces
-        FIN = 5      // Disconnect: Cleanly close a peer session
+        SYN = 1,
+        SYN_ACK = 2,
+        DATA = 3,
+        ACK = 4,
+        FIN = 5,
+        CHOKE = 6,   // <-- Add this
+        UNCHOKE = 7  // <-- Add this
     };
-
     // Protocol capacity boundaries
     constexpr size_t MAX_PAYLOAD_SIZE = 1400;
     constexpr size_t HEADER_SIZE = 9; // 1 byte (Type) + 4 bytes (Seq) + 2 bytes (Len) + 2 bytes (Checksum)
