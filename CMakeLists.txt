@@ -6,11 +6,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(include)
 
-# Binding all structural implementations together
+# Binding all structural implementations together into our output target binary
 add_executable(p2p_app 
     src/main.cpp 
     src/packet.cpp
     src/reliable_socket.cpp
     src/socket_manager.cpp
     src/piece_manager.cpp
- "include/socket_manager.h" "src/socket_manager.cpp" "include/piece_manager.h" "src/piece_manager.cpp")
+    src/handshake_manager.cpp
+)
