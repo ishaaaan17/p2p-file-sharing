@@ -21,6 +21,13 @@ struct SwarmPeerNode {
     std::unique_ptr<P2P::PeerSessionManager> session;
 };
 
+// --- RELIABILITY LAYER: tracks an outstanding piece request so it can be retransmitted on timeout ---
+struct PendingRequest {
+    uint32_t piece_idx;
+    std::chrono::steady_clock::time_point sent_at;
+    int retries = 0;
+};
+
 // --- TELEMETRY HELPER TO FEED THE PYTHON DASHBOARD ---
 void send_telemetry_to_dashboard(P2P::SocketManager& socket_mgr, const std::string& type, uint16_t port, uint64_t downloaded, uint64_t uploaded, const std::string& status, int32_t piece_idx = -1) {
     std::string json_str;
@@ -123,7 +130,11 @@ int main() {
 
     std::map<uint16_t, SwarmPeerNode> active_swarm_nodes;
     std::vector<std::vector<bool>> global_swarm_bitfields;
+    std::map<uint16_t, PendingRequest> outstanding_requests; // reliability: what we're waiting to hear back on
     bool running = true;
+
+    const auto REQUEST_TIMEOUT = std::chrono::milliseconds(500);
+    const int MAX_REQUEST_RETRIES = 5;
 
     std::cout << "\n -> Complete Swarm Active! Press 'h' to Handshake Swarm, 't' to exit via FIN, 'q' to quit." << std::endl;
 
@@ -177,6 +188,7 @@ int main() {
                     if (rare_chunk != -1) {
                         P2P::Packet req = current_node.session->create_piece_request(static_cast<uint32_t>(rare_chunk));
                         socket_mgr.send_data_to(req, sender_ep.ip, origin_port);
+                        outstanding_requests[origin_port] = { static_cast<uint32_t>(rare_chunk), std::chrono::steady_clock::now(), 0 };
 
                         send_telemetry_to_dashboard(socket_mgr, "PIECE_UPDATE", 0, 0, 0, "Downloading", rare_chunk);
                     }
@@ -198,8 +210,9 @@ int main() {
                     P2P::Packet resp = active_swarm_nodes[origin_port].session->fulfill_piece_request_from_disk(inbound_pkt, piece_mgr);
                     socket_mgr.send_data_to(resp, sender_ep.ip, origin_port);
 
-                    choke_mgr.record_download(origin_port, resp.data_len);
-                    peer_downloaded_bytes[origin_port] += resp.data_len;
+                    // We are SERVING this peer a piece -> this is an upload from our perspective.
+                    choke_mgr.record_upload(origin_port, resp.data_len);
+                    peer_uploaded_bytes[origin_port] += resp.data_len;
 
                     send_telemetry_to_dashboard(socket_mgr, "PEER_UPDATE", origin_port, peer_downloaded_bytes[origin_port], peer_uploaded_bytes[origin_port], "UNCHOKED");
                 }
@@ -208,8 +221,12 @@ int main() {
                     if (current_node.session->verify_and_process_incoming_block(inbound_pkt, inbound_pkt.seq_num)) {
 
                         piece_mgr.write_piece_to_disk(inbound_pkt.seq_num, inbound_pkt.payload, inbound_pkt.data_len);
-                        choke_mgr.record_upload(origin_port, inbound_pkt.data_len);
-                        peer_uploaded_bytes[origin_port] += inbound_pkt.data_len;
+                        // We RECEIVED this piece from the peer -> this is a download from our perspective.
+                        choke_mgr.record_download(origin_port, inbound_pkt.data_len);
+                        peer_downloaded_bytes[origin_port] += inbound_pkt.data_len;
+
+                        // This request has been fulfilled - stop waiting on it.
+                        outstanding_requests.erase(origin_port);
 
                         std::cout << "[DISK WRITE] Successfully saved Piece #" << inbound_pkt.seq_num << std::endl;
 
@@ -234,6 +251,7 @@ int main() {
                         if (next_chunk != -1) {
                             P2P::Packet req = active_swarm_nodes[chosen_port].session->create_piece_request(static_cast<uint32_t>(next_chunk));
                             socket_mgr.send_data_to(req, active_swarm_nodes[chosen_port].endpoint.ip, chosen_port);
+                            outstanding_requests[chosen_port] = { static_cast<uint32_t>(next_chunk), std::chrono::steady_clock::now(), 0 };
                             send_telemetry_to_dashboard(socket_mgr, "PIECE_UPDATE", 0, 0, 0, "Downloading", next_chunk);
                         }
                         else {
@@ -271,6 +289,32 @@ int main() {
             running = false;
         }
 #endif
+
+        // --- RELIABILITY LAYER: retransmit any piece request that's gone unanswered past the timeout ---
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = outstanding_requests.begin(); it != outstanding_requests.end(); ) {
+            uint16_t port = it->first;
+            PendingRequest& pending = it->second;
+
+            if (now - pending.sent_at > REQUEST_TIMEOUT) {
+                if (pending.retries >= MAX_REQUEST_RETRIES || !active_swarm_nodes.count(port)) {
+                    std::cout << "[RELIABILITY] Giving up on piece #" << pending.piece_idx
+                        << " from port " << port << " after " << pending.retries << " retries." << std::endl;
+                    it = outstanding_requests.erase(it);
+                    continue;
+                }
+
+                auto& node = active_swarm_nodes[port];
+                std::cout << "[RELIABILITY] No response for piece #" << pending.piece_idx
+                    << " from port " << port << " - retransmitting (attempt " << (pending.retries + 1) << ")" << std::endl;
+                P2P::Packet req = node.session->create_piece_request(pending.piece_idx);
+                socket_mgr.send_data_to(req, node.endpoint.ip, port);
+                pending.sent_at = now;
+                pending.retries++;
+            }
+            ++it;
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
