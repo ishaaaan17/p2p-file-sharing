@@ -192,4 +192,4 @@ The current implementation holds piece data in memory buffers, which is fine for
 
 ## 9. License
 
-Add your license of choice here (MIT, Apache 2.0, GPLv3, etc.) before publishing.
+MIT License — see [`LICENSE`](./LICENSE) for the full text. In short: use it, modify it, ship it, just keep the copyright notice attached.
