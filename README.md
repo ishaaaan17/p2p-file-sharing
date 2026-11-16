@@ -15,8 +15,8 @@ Every message on the wire — regardless of purpose — travels inside the same 
 
 | Type | Role |
 |---|---|
-| `SYN` | Opening handshake greeting |
-| `SYN_ACK` | Handshake reply, carries the responder's bitfield |
+| `SYN` | Opening handshake greeting, carries the sender's file metadata (name, size, piece size, piece count) |
+| `SYN_ACK` | Handshake reply, carries the responder's file metadata, bitfield, and a SHA-256 hash manifest of the pieces it owns |
 | `DATA` | Piece request (empty payload) or piece delivery (full payload) |
 | `ACK` | Confirms a piece was received intact |
 | `FIN` | Clean, intentional session teardown |
@@ -43,13 +43,19 @@ The design intent is textbook Tit-for-Tat: track bytes given and bytes received 
 
 `main.cpp` calls `record_upload()` on the path where the local node *serves* a piece to a peer, and `record_download()` on the path where it *receives* one, so the byte counters — and the resulting choke decisions — reflect the local node's actual role in each exchange. The dashboard's "Downloaded" / "Uploaded" columns per peer follow the same convention.
 
-There is also no optimistic unchoke in this build — real BitTorrent occasionally unchokes a random peer regardless of score, to give new or slow peers a chance to prove themselves. This implementation is strict reciprocity only, evaluated per incoming piece request rather than on a fixed timer, and it only ever sends `CHOKE` — nothing in this code path currently emits an `UNCHOKE` packet back out.
+There is also no optimistic unchoke in this build — real BitTorrent occasionally unchokes a random peer regardless of score, to give new or slow peers a chance to prove themselves. This implementation is strict reciprocity, evaluated per incoming piece request rather than on a fixed timer, with two fairness rules on top: every peer starts **unchoked** with a one-piece grace allowance, and a peer that owns nothing the local node needs — so it *cannot* reciprocate, like a leecher talking to a complete seeder — is never choked at all. Both `CHOKE` and `UNCHOKE` packets are emitted whenever a peer's choke state actually changes.
 
 ### Reliability Layer — Timeout-Based Retransmission
-Piece requests are tracked in an `outstanding_requests` map keyed by peer port, recording which piece was asked for and when. A sweep on every loop iteration checks that map against a 500ms timeout; anything unanswered gets the same request resent, up to 5 attempts, after which the node gives up on that request and logs it. This closes the gap where a lost `DATA` request or its response would otherwise stall a piece indefinitely with no recovery path. It's a basic timeout/retry mechanism, not a full sliding-window protocol with RTT estimation — there's room to make the timeout adaptive rather than fixed.
+Piece requests are tracked in an `outstanding_requests` map keyed by peer port, recording which piece was asked for and when. A sweep on every loop iteration checks that map against a 500ms timeout; anything unanswered gets the same request resent, up to 5 attempts, after which the node gives up on that request and logs it. This closes the gap where a lost `DATA` request or its response would otherwise stall a piece indefinitely with no recovery path. It's a basic timeout/retry mechanism, not a full sliding-window protocol with RTT estimation — there's room to make the timeout adaptive rather than fixed. Recovery is **best-effort**: up to 5 retransmissions per request, then the piece is given up on. There is no zero-drop guarantee.
+
+### Piece Integrity — SHA-256 Manifest
+The 16-bit packet checksum catches random wire corruption, but it is trivially forgeable and says nothing about whether the *right* bytes arrived. So the handshake now carries real integrity: a serving node computes the SHA-256 hash of every piece it owns and sends that manifest inside its `SYN_ACK` (after the bitfield; pieces it doesn't own get an all-zero "hash unknown" entry). The receiver verifies the SHA-256 of every incoming `DATA` payload against the manifest **before** the piece is written to disk; a mismatch is dropped and the piece is re-requested. The SHA-256 implementation is dependency-free (`src/sha256.cpp`) and verified against the standard FIPS test vectors in the test suite.
+
+### Negotiated File Metadata
+File size, piece size, piece count and file name are negotiated in `SYN`/`SYN_ACK` instead of being hardcoded — the demo defaults (6000 bytes, 1000-byte pieces, 6 pieces) are simply the defaults both sides start from. A node that still owns zero pieces adopts a peer's different parameters by re-laying-out its file; a node already holding pieces keeps its layout.
 
 ### Python Live Telemetry Dashboard
-`dashboard.py` runs as its own process. On first load it spins up a background Python thread that binds a UDP socket to `127.0.0.1:6000` and sits in a loop parsing whatever JSON frames arrive, updating `st.session_state`. The Streamlit frontend redraws on a roughly one-second loop (`time.sleep(1)` followed by `st.rerun()`), showing a per-piece status grid (Missing / Downloading / Completed), a connected-peer table with byte counters and choke state, and two buttons that don't actually trigger anything in the C++ process — they're currently visual only, since there's no reverse channel from the browser back to the swarm.
+`dashboard.py` runs as its own process. On first load it spins up a background Python thread that binds a UDP socket to `127.0.0.1:6000` and sits in a loop parsing whatever telemetry frames arrive, updating `st.session_state`. The C++ side wraps its JSON in the binary `Packet` frame, so the listener strips the 9-byte header before parsing the JSON (raw, unwrapped JSON is also accepted); parse failures are logged, never silently swallowed. The Streamlit frontend redraws on a roughly one-second loop (`time.sleep(1)` followed by `st.rerun()`), showing a per-piece status grid (Missing / Downloading / Completed), a connected-peer table with byte counters and choke state, and two buttons that don't actually trigger anything in the C++ process — they're currently visual only, since there's no reverse channel from the browser back to the swarm.
 
 Because every C++ node instance sends its telemetry to the same `127.0.0.1:6000` destination, a single running dashboard aggregates events from however many local nodes are active. Since the dashboard keys its peer table by the *remote* port each event refers to, running all three demo nodes against one dashboard gives a reasonable combined picture of swarm activity, though it doesn't distinguish which local node originated which event.
 
@@ -108,26 +114,33 @@ Because every C++ node instance sends its telemetry to the same `127.0.0.1:6000`
 ## 📦 Project Directory Structure
 
 ```
-p2p-swarm-core/
+p2p-file-sharing/
 ├── include/
 │   ├── packet.h                 # Packet struct + PacketType enum (SYN..UNCHOKE)
 │   ├── socket_manager.h         # Two-thread UDP transport, thread-safe frame queue
-│   ├── handshake_manager.h      # SYN / SYN_ACK exchange, bitfield compression
+│   ├── handshake_manager.h      # SYN / SYN_ACK exchange, metadata + bitfield + hash manifest
 │   ├── piece_manager.h          # Disk-backed piece storage, seekp/seekg I/O
 │   ├── peer_session_manager.h   # Rarest-first scheduling, request/response logic
-│   └── choke_manager.h          # Tit-for-Tat upload/download tracking
+│   ├── choke_manager.h          # Tit-for-Tat upload/download tracking (header-only)
+│   └── sha256.h                 # Dependency-free SHA-256 for piece integrity
 │
 ├── src/
+│   ├── main.cpp                 # Entry point: CLI setup, main event loop, telemetry dispatch
+│   ├── packet.cpp               # Packet serialize/deserialize + checksum
 │   ├── socket_manager.cpp       # SocketManager implementation
 │   ├── handshake_manager.cpp    # HandshakeManager implementation
-│   ├── piece_manager.cpp        # Header-only class; translation unit only includes piece_manager.h
-│   ├── choke_manager.cpp        # Header-only class; translation unit only includes choke_manager.h
-│   └── main.cpp                 # Entry point: CLI setup, main event loop, telemetry dispatch
+│   ├── piece_manager.cpp        # PieceManager implementation
+│   ├── peer_session_manager.cpp # PeerSessionManager implementation
+│   └── sha256.cpp               # SHA-256 implementation (FIPS 180-4)
 │
-├── dashboard/
-│   ├── dashboard.py             # Streamlit UI + background UDP telemetry listener
-│   └── requirements.txt         # streamlit, pandas
+├── tests/
+│   ├── test_main.cpp            # C++ test suite (CTest): packet, SHA-256, pieces, choke, handshake
+│   ├── test_dashboard_parse.py  # Dashboard telemetry-parser test
+│   └── CMakeLists.txt
 │
+├── dashboard.py                 # Streamlit UI + background UDP telemetry listener
+├── requirements.txt             # streamlit, pandas (for dashboard.py)
+├── CMakeLists.txt               # Builds p2p_app (+ p2p_tests via CTest)
 ├── LICENSE
 └── README.md
 ```
@@ -138,18 +151,28 @@ p2p-swarm-core/
 
 This walks through running two seeders and one leecher locally, with the dashboard watching all three.
 
-### 1. Compile the C++ binary (Visual Studio)
+### 1. Compile the C++ binary (CMake, Windows or Linux)
 
-1. Open the project folder in Visual Studio as a CMake or `.sln` project (whichever your workspace uses).
-2. Set the solution configuration to **x64** and either **Debug** or **Release**.
-3. Build the solution (`Ctrl+Shift+B`). Confirm `p2p_core.exe` (or your configured output name) lands in `x64/Debug/` or `x64/Release/`.
-4. `main.cpp` reads from `source_asset.txt` if it exists in the working directory (falls back to synthetic placeholder data if the file is missing) — drop any 6000-byte-or-smaller test file named `source_asset.txt` next to the executable if you want to test with real content.
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+```
+
+This produces the `p2p_app` binary (`p2p_app.exe` on Windows) under `build/`. Run the test suite with:
+
+```bash
+ctest --test-dir build -C Release --output-on-failure
+python tests/test_dashboard_parse.py
+```
+
+(Visual Studio users can instead open the folder as a CMake project and build the `p2p_app` target.)
+
+`main.cpp` reads from `source_asset.txt` if it exists in the working directory (falls back to synthetic placeholder data if the file is missing) — drop any 6000-byte-or-smaller test file named `source_asset.txt` next to the executable if you want to test with real content.
 
 ### 2. Set up the Python dashboard
 
 ```bash
-cd dashboard
-pip install streamlit pandas
+pip install -r requirements.txt
 streamlit run dashboard.py
 ```
 
