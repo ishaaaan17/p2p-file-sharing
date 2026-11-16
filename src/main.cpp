@@ -81,7 +81,33 @@ int main() {
     P2P::ChokeManager choke_mgr;
 
     std::string filename = "peer_" + std::to_string(local_peer_id) + "_storage.bin";
-    piece_mgr.initialize_file_layout(filename, 6000, 1000);
+
+    // File metadata negotiated in the handshake. Defaults are the original
+    // demo values (6000 bytes / 1000-byte pieces / 6 pieces); a peer whose
+    // SYN/SYN_ACK carries different values replaces them (see adoption
+    // below) instead of the numbers being hardcoded in three places.
+    P2P::FileMetadata file_meta;
+    file_meta.file_name = filename;
+    handshake_mgr.set_file_metadata(file_meta);
+    piece_mgr.initialize_file_layout(filename, file_meta.file_size, file_meta.piece_size);
+
+    // Metadata adoption: if a peer negotiates different file parameters and
+    // we still own zero pieces (nothing to lose), re-lay-out our file to the
+    // negotiated values. A node that already holds pieces keeps its layout.
+    auto adopt_remote_metadata = [&](const P2P::FileMetadata& remote_meta) {
+        bool differs = remote_meta.total_pieces != file_meta.total_pieces ||
+            remote_meta.piece_size != file_meta.piece_size ||
+            remote_meta.file_size != file_meta.file_size;
+        bool own_nothing = piece_mgr.get_missing_pieces_count() == piece_mgr.get_total_pieces();
+        if (differs && own_nothing && remote_meta.file_size > 0 && remote_meta.piece_size > 0) {
+            file_meta = remote_meta;
+            file_meta.file_name = filename;
+            handshake_mgr.set_file_metadata(file_meta);
+            piece_mgr.initialize_file_layout(filename, file_meta.file_size, file_meta.piece_size);
+            std::cout << "[SWARM] Adopted negotiated file metadata: " << file_meta.file_size
+                << " bytes, " << file_meta.total_pieces << " pieces x " << file_meta.piece_size << std::endl;
+        }
+    };
 
     // Track state metrics locally for telemetry aggregation
     std::map<uint16_t, uint64_t> peer_uploaded_bytes;
@@ -92,23 +118,23 @@ int main() {
         std::cout << "[Seeding Mode] Loading real file data streams into mesh memory..." << std::endl;
 
         std::ifstream source_file("source_asset.txt", std::ios::binary);
-        uint8_t chunk[1000];
+        std::vector<uint8_t> chunk(file_meta.piece_size);
 
-        uint32_t start_piece = (local_peer_id == 2002) ? 0 : 3;
-        uint32_t end_piece = (local_peer_id == 2002) ? 3 : 6;
+        uint32_t start_piece = (local_peer_id == 2002) ? 0 : file_meta.total_pieces / 2;
+        uint32_t end_piece = (local_peer_id == 2002) ? file_meta.total_pieces / 2 : file_meta.total_pieces;
 
         if (source_file.is_open()) {
-            for (uint32_t i = 0; i < 6; ++i) {
-                source_file.seekg(i * 1000);
-                source_file.read(reinterpret_cast<char*>(chunk), 1000);
+            for (uint32_t i = 0; i < file_meta.total_pieces; ++i) {
+                source_file.seekg(i * file_meta.piece_size);
+                source_file.read(reinterpret_cast<char*>(chunk.data()), file_meta.piece_size);
 
                 std::streamsize bytes_read = source_file.gcount();
-                if (bytes_read < 1000) {
-                    std::memset(chunk + bytes_read, ' ', 1000 - bytes_read);
+                if (bytes_read < static_cast<std::streamsize>(file_meta.piece_size)) {
+                    std::memset(chunk.data() + bytes_read, ' ', file_meta.piece_size - bytes_read);
                 }
 
                 if (i >= start_piece && i < end_piece) {
-                    piece_mgr.write_piece_to_disk(i, chunk, 1000);
+                    piece_mgr.write_piece_to_disk(i, chunk.data(), file_meta.piece_size);
                 }
             }
             source_file.close();
@@ -117,8 +143,8 @@ int main() {
         else {
             std::cout << " -> [Notice] 'source_asset.txt' not found. Falling back to structured string patterns." << std::endl;
             for (uint32_t i = start_piece; i < end_piece; ++i) {
-                std::memset(chunk, 'A' + i, 1000);
-                piece_mgr.write_piece_to_disk(i, chunk, 1000);
+                std::memset(chunk.data(), 'A' + i, file_meta.piece_size);
+                piece_mgr.write_piece_to_disk(i, chunk.data(), file_meta.piece_size);
             }
         }
     }
@@ -157,7 +183,9 @@ int main() {
 
             if (inbound_pkt.type == P2P::PacketType::SYN) {
                 uint32_t remote_id = 0;
-                if (handshake_mgr.process_incoming_handshake(inbound_pkt, remote_id)) {
+                P2P::FileMetadata remote_meta;
+                if (handshake_mgr.process_incoming_handshake(inbound_pkt, remote_id, &remote_meta)) {
+                    adopt_remote_metadata(remote_meta);
                     // Serving always starts unchoked; Tit-for-Tat may choke later.
                     choke_mgr.set_choke_status(origin_port, false);
                     std::cout << "[SWARM EVENT] Accepted valid SYN handshake from Port: " << origin_port << std::endl;
@@ -169,7 +197,10 @@ int main() {
             }
             else if (inbound_pkt.type == P2P::PacketType::SYN_ACK) {
                 std::vector<bool> remote_bitfield;
-                if (handshake_mgr.process_incoming_syn_ack(inbound_pkt, remote_bitfield, 6)) {
+                P2P::FileMetadata remote_meta;
+                std::vector<std::array<uint8_t, 32>> remote_hashes;
+                if (handshake_mgr.process_incoming_syn_ack(inbound_pkt, remote_bitfield, remote_meta, remote_hashes)) {
+                    adopt_remote_metadata(remote_meta);
                     std::cout << "[SWARM EVENT] Decoded bitfield map from neighbor port: " << origin_port << std::endl;
 
                     SwarmPeerNode node;
