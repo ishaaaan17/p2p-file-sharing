@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace P2P {
@@ -25,6 +26,15 @@ namespace P2P {
         uint16_t data_len;
         uint16_t checksum;
         uint8_t payload[MAX_PAYLOAD_SIZE];
+
+        // Every Packet starts fully initialised. Before this constructor
+        // existed, packets built field-by-field (CHOKE, telemetry) carried
+        // uninitialised seq_num/data_len/checksum bytes onto the wire —
+        // serialising them was undefined behaviour.
+        Packet()
+            : type(PacketType::SYN), seq_num(0), data_len(0), checksum(0), payload{} {
+            std::memset(payload, 0, MAX_PAYLOAD_SIZE);
+        }
 
         // Transforms our C++ structure variables into a flat, raw byte sequence
         std::vector<uint8_t> serialize() const;
