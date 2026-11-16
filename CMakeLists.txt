@@ -17,6 +17,7 @@ add_executable(p2p_app
     src/piece_manager.cpp
     src/handshake_manager.cpp
     src/peer_session_manager.cpp
+    src/sha256.cpp
 )
 
 if(WIN32)
