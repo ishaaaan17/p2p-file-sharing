@@ -25,3 +25,6 @@ if(WIN32)
     # MSVC-only #pragma comment(lib) inside the headers.
     target_link_libraries(p2p_app PRIVATE ws2_32)
 endif()
+
+enable_testing()
+add_subdirectory(tests)
