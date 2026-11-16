@@ -1,8 +1,10 @@
 #pragma once
+#include <array>
 #include <cstdint>
 #include <vector>
 #include "packet.h"
 #include "piece_manager.h"
+#include "sha256.h"
 
 namespace P2P {
 
@@ -10,6 +12,10 @@ namespace P2P {
     private:
         uint32_t m_remote_peer_id;
         std::vector<bool> m_remote_bitfield;
+        // SHA-256 manifest received in this peer's SYN_ACK (one hash per
+        // piece). An all-zero entry means "hash unknown" — the peer did not
+        // own that piece at handshake time, so it could not hash it.
+        std::vector<std::array<uint8_t, 32>> m_piece_hashes;
 
     public:
         PeerSessionManager(uint32_t remote_id, const std::vector<bool>& remote_bitfield);
@@ -29,6 +35,14 @@ namespace P2P {
 
         // Validates an incoming data block payload before marking it complete
         bool verify_and_process_incoming_block(const Packet& data_packet, uint32_t expected_index) const;
+
+        // SHA-256 manifest from this peer's SYN_ACK (see handshake).
+        void set_piece_hashes(const std::vector<std::array<uint8_t, 32>>& hashes) { m_piece_hashes = hashes; }
+
+        // True when the piece's SHA-256 matches the manifest, or when no
+        // hash is known for it (older peer / piece unowned at handshake —
+        // those pieces are still covered by the packet checksum).
+        bool verify_piece_hash(const Packet& data_packet) const;
 
         // Creates an acknowledgement packet to confirm a successful chunk write
         Packet create_acknowledgement(uint32_t piece_index) const;

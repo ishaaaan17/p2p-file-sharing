@@ -83,6 +83,19 @@ namespace P2P {
         return true;
     }
 
+    bool PeerSessionManager::verify_piece_hash(const Packet& data_packet) const {
+        if (m_piece_hashes.empty() || data_packet.seq_num >= m_piece_hashes.size()) {
+            return true; // No manifest from this peer — checksum-only validation.
+        }
+        const auto& expected = m_piece_hashes[data_packet.seq_num];
+        bool hash_unknown = true;
+        for (uint8_t byte : expected) {
+            if (byte != 0) { hash_unknown = false; break; }
+        }
+        if (hash_unknown) return true; // Peer didn't own this piece at handshake.
+        return sha256(data_packet.payload, data_packet.data_len) == expected;
+    }
+
     Packet PeerSessionManager::create_acknowledgement(uint32_t piece_index) const {
         Packet packet;
         packet.type = PacketType::ACK;

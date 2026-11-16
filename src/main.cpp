@@ -8,6 +8,7 @@
 #include <map>
 #include <fstream>
 #include "packet.h"
+#include "sha256.h"
 #include "socket_manager.h"
 #include "piece_manager.h"
 #include "handshake_manager.h"
@@ -189,7 +190,28 @@ int main() {
                     // Serving always starts unchoked; Tit-for-Tat may choke later.
                     choke_mgr.set_choke_status(origin_port, false);
                     std::cout << "[SWARM EVENT] Accepted valid SYN handshake from Port: " << origin_port << std::endl;
-                    P2P::Packet syn_ack = handshake_mgr.prepare_syn_ack_packet(piece_mgr.get_bitfield());
+                    // Build the SHA-256 manifest for the pieces we own, so the
+                    // requester can verify every piece before writing it to
+                    // disk. Pieces we don't own keep an all-zero entry, which
+                    // the receiver treats as "hash unknown".
+                    std::vector<std::array<uint8_t, 32>> local_hashes;
+                    {
+                        std::vector<bool> owned = piece_mgr.get_bitfield();
+                        bool any_owned = false;
+                        for (bool b : owned) if (b) { any_owned = true; break; }
+                        if (any_owned) {
+                            local_hashes.assign(owned.size(), {});
+                            std::vector<uint8_t> piece_buf(file_meta.piece_size);
+                            for (size_t i = 0; i < owned.size(); ++i) {
+                                if (!owned[i]) continue;
+                                uint32_t bytes_read = 0;
+                                if (piece_mgr.read_piece_from_disk(static_cast<uint32_t>(i), piece_buf.data(), bytes_read)) {
+                                    local_hashes[i] = P2P::sha256(piece_buf.data(), bytes_read);
+                                }
+                            }
+                        }
+                    }
+                    P2P::Packet syn_ack = handshake_mgr.prepare_syn_ack_packet(piece_mgr.get_bitfield(), local_hashes);
                     socket_mgr.send_data_to(syn_ack, sender_ep.ip, origin_port);
 
                     send_telemetry_to_dashboard(socket_mgr, "PEER_UPDATE", origin_port, 0, 0, "UNCHOKED");
@@ -206,6 +228,9 @@ int main() {
                     SwarmPeerNode node;
                     node.endpoint = sender_ep;
                     node.session = std::make_unique<P2P::PeerSessionManager>(origin_port, remote_bitfield);
+                    if (!remote_hashes.empty()) {
+                        node.session->set_piece_hashes(remote_hashes);
+                    }
 
                     active_swarm_nodes[origin_port] = std::move(node);
 
@@ -283,6 +308,20 @@ int main() {
                     std::vector<bool> owned_bf = piece_mgr.get_bitfield();
                     bool already_owned = inbound_pkt.seq_num < owned_bf.size() && owned_bf[inbound_pkt.seq_num];
                     if (!already_owned && current_node.session->verify_and_process_incoming_block(inbound_pkt, expected_index)) {
+
+                        // SHA-256 integrity: verify against the handshake
+                        // manifest BEFORE the piece touches disk. A mismatch
+                        // means corruption or a hostile sender — drop the
+                        // piece and re-request it instead of writing it.
+                        if (!current_node.session->verify_piece_hash(inbound_pkt)) {
+                            std::cerr << "[INTEGRITY] SHA-256 mismatch on piece #" << inbound_pkt.seq_num
+                                << " from port " << origin_port << " — dropping and re-requesting." << std::endl;
+                            P2P::Packet re_req = current_node.session->create_piece_request(inbound_pkt.seq_num);
+                            socket_mgr.send_data_to(re_req, sender_ep.ip, origin_port);
+                            int prev_retries = (pending_it != outstanding_requests.end()) ? pending_it->second.retries : 0;
+                            outstanding_requests[origin_port] = { inbound_pkt.seq_num, std::chrono::steady_clock::now(), prev_retries + 1 };
+                            continue;
+                        }
 
                         if (!piece_mgr.write_piece_to_disk(inbound_pkt.seq_num, inbound_pkt.payload, inbound_pkt.data_len)) {
                             std::cerr << "[DISK WRITE] Rejected piece #" << inbound_pkt.seq_num << " (validation failed)." << std::endl;
