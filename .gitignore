@@ -19,3 +19,8 @@ cmake_install.cmake
 *.pdb
 *.obj
 *.ilk
+
+# Runtime artifacts from running the demo (don't dirty the repo)
+peer_*_storage.bin
+source_asset.txt
+__pycache__/
