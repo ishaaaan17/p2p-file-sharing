@@ -158,6 +158,8 @@ int main() {
             if (inbound_pkt.type == P2P::PacketType::SYN) {
                 uint32_t remote_id = 0;
                 if (handshake_mgr.process_incoming_handshake(inbound_pkt, remote_id)) {
+                    // Serving always starts unchoked; Tit-for-Tat may choke later.
+                    choke_mgr.set_choke_status(origin_port, false);
                     std::cout << "[SWARM EVENT] Accepted valid SYN handshake from Port: " << origin_port << std::endl;
                     P2P::Packet syn_ack = handshake_mgr.prepare_syn_ack_packet(piece_mgr.get_bitfield());
                     socket_mgr.send_data_to(syn_ack, sender_ep.ip, origin_port);
@@ -196,14 +198,33 @@ int main() {
             }
             else if (inbound_pkt.type == P2P::PacketType::DATA) {
                 if (inbound_pkt.data_len == 0 && active_swarm_nodes.count(origin_port)) {
-                    if (choke_mgr.should_choke_peer(origin_port)) {
-                        if (!choke_mgr.get_choke_status(origin_port)) {
-                            P2P::Packet choke_pkt;
-                            choke_pkt.type = P2P::PacketType::CHOKE;
-                            socket_mgr.send_data_to(choke_pkt, sender_ep.ip, origin_port);
-                            choke_mgr.set_choke_status(origin_port, true);
-                            send_telemetry_to_dashboard(socket_mgr, "PEER_UPDATE", origin_port, peer_downloaded_bytes[origin_port], peer_uploaded_bytes[origin_port], "CHOKED");
+                    // Reciprocation is only possible if this peer owns a piece
+                    // we still need (per its handshake bitfield snapshot). A
+                    // peer that can give us nothing — e.g. a leecher asking a
+                    // complete seeder — is never choked for not giving back.
+                    {
+                        bool can_reciprocate = false;
+                        std::vector<bool> remote_bf = active_swarm_nodes[origin_port].session->get_remote_bitfield();
+                        std::vector<bool> local_bf = piece_mgr.get_bitfield();
+                        for (size_t i = 0; i < local_bf.size() && i < remote_bf.size(); ++i) {
+                            if (!local_bf[i] && remote_bf[i]) { can_reciprocate = true; break; }
                         }
+                        choke_mgr.set_can_reciprocate(origin_port, can_reciprocate);
+                    }
+
+                    // Emit CHOKE / UNCHOKE on every state change, not just choke.
+                    bool want_choke = choke_mgr.should_choke_peer(origin_port);
+                    if (want_choke != choke_mgr.get_choke_status(origin_port)) {
+                        P2P::Packet state_pkt;
+                        state_pkt.type = want_choke ? P2P::PacketType::CHOKE : P2P::PacketType::UNCHOKE;
+                        state_pkt.checksum = state_pkt.calculate_checksum();
+                        socket_mgr.send_data_to(state_pkt, sender_ep.ip, origin_port);
+                        choke_mgr.set_choke_status(origin_port, want_choke);
+                        std::cout << "[GAME THEORY] " << (want_choke ? "CHOKED" : "UNCHOKED")
+                            << " peer on Port " << origin_port << std::endl;
+                        send_telemetry_to_dashboard(socket_mgr, "PEER_UPDATE", origin_port, peer_downloaded_bytes[origin_port], peer_uploaded_bytes[origin_port], want_choke ? "CHOKED" : "UNCHOKED");
+                    }
+                    if (want_choke) {
                         continue;
                     }
 
