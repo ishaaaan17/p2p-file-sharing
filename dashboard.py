@@ -5,6 +5,25 @@ import time
 import streamlit as st
 import pandas as pd
 
+# The C++ engine wraps telemetry JSON in its binary Packet frame:
+# a 9-byte header (1 type + 4 seq + 2 len + 2 checksum) followed by the JSON
+# payload. The original dashboard ran json.loads() on the raw datagram, which
+# always failed on the binary header — and the bare `except: pass` hid it, so
+# the dashboard silently never updated.
+PACKET_HEADER_SIZE = 9
+
+
+def parse_telemetry_frame(data: bytes):
+    """Parse one telemetry datagram: raw JSON, or Packet-framed JSON."""
+    try:
+        return json.loads(data.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        pass
+    if len(data) > PACKET_HEADER_SIZE:
+        payload = data[PACKET_HEADER_SIZE:]
+        return json.loads(payload.decode('utf-8'))
+    raise ValueError("Telemetry datagram too short to contain a frame")
+
 # --- STATE MANAGEMENT CONFIGURATION ---
 # Streamlit updates on every rerun, so we store persistent peer data in session_state
 if "swarm_data" not in st.session_state:
@@ -29,7 +48,7 @@ def network_listener_loop():
             data, _ = sock.recvfrom(2048)
             # Expected JSON format: {"type": "PEER_UPDATE", "port": 9999, "downloaded": 1000, "uploaded": 0, "status": "UNCHOKED"}
             # Expected JSON format: {"type": "PIECE_UPDATE", "index": 0, "status": "Completed"}
-            frame = json.loads(data.decode('utf-8'))
+            frame = parse_telemetry_frame(data)
             
             if frame["type"] == "PEER_UPDATE":
                 p_port = str(frame["port"])
@@ -42,8 +61,10 @@ def network_listener_loop():
                 idx = frame["index"]
                 if 0 <= idx < len(st.session_state.swarm_data["pieces_status"]):
                     st.session_state.swarm_data["pieces_status"][idx] = frame["status"]
-        except Exception:
-            pass
+        except Exception as e:
+            # Never swallow silently again — a parse failure here once hid
+            # the header/JSON mismatch for the life of the project.
+            print(f"[Dashboard] Dropping malformed telemetry frame: {e}")
         time.sleep(0.05)
 
 # Start the background socket thread once
