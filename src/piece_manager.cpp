@@ -41,6 +41,24 @@ namespace P2P {
     bool PieceManager::write_piece_to_disk(uint32_t piece_index, const uint8_t* payload_buffer, uint32_t payload_size) {
         std::lock_guard<std::mutex> lock(m_disk_mutex);
 
+        // Bounds validation: previously any piece_index was trusted, so a
+        // buggy/hostile DATA packet with seq >= total_pieces seeked/wrote
+        // past the end of the pre-allocated file and indexed the bitfield
+        // out of bounds.
+        if (piece_index >= m_total_pieces) {
+            std::cerr << "[Disk Error] Piece index " << piece_index << " out of range (total "
+                << m_total_pieces << "). Write rejected." << std::endl;
+            return false;
+        }
+        uint32_t expected_size = (piece_index == m_total_pieces - 1)
+            ? (m_total_file_size - piece_index * m_piece_size)
+            : m_piece_size;
+        if (payload_buffer == nullptr || payload_size > expected_size) {
+            std::cerr << "[Disk Error] Piece " << piece_index << " payload size " << payload_size
+                << " exceeds expected " << expected_size << ". Write rejected." << std::endl;
+            return false;
+        }
+
         // Open file stream in "in/out" mode so we overwrite specific regions without cleaning the rest
         std::fstream disk_file(m_file_path, std::ios::binary | std::ios::in | std::ios::out);
         if (!disk_file) {
@@ -60,6 +78,13 @@ namespace P2P {
 
     bool PieceManager::read_piece_from_disk(uint32_t piece_index, uint8_t* out_buffer, uint32_t& out_size) const {
         std::lock_guard<std::mutex> lock(m_disk_mutex);
+
+        if (piece_index >= m_total_pieces) {
+            std::cerr << "[Disk Error] Piece index " << piece_index << " out of range (total "
+                << m_total_pieces << "). Read rejected." << std::endl;
+            out_size = 0;
+            return false;
+        }
 
         std::ifstream disk_file(m_file_path, std::ios::binary);
         if (!disk_file) return false;

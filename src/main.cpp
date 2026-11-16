@@ -239,9 +239,24 @@ int main() {
                 }
                 else if (inbound_pkt.data_len > 0 && active_swarm_nodes.count(origin_port)) {
                     auto& current_node = active_swarm_nodes[origin_port];
-                    if (current_node.session->verify_and_process_incoming_block(inbound_pkt, inbound_pkt.seq_num)) {
+                    // Validate against LOCAL state, not the packet's own seq:
+                    // the piece we actually requested from this peer is the
+                    // expected index (the old code passed inbound_pkt.seq_num
+                    // as its own expectation — a tautology that validated
+                    // nothing). Pieces we already own are duplicates.
+                    uint32_t expected_index = inbound_pkt.seq_num;
+                    auto pending_it = outstanding_requests.find(origin_port);
+                    if (pending_it != outstanding_requests.end()) {
+                        expected_index = pending_it->second.piece_idx;
+                    }
+                    std::vector<bool> owned_bf = piece_mgr.get_bitfield();
+                    bool already_owned = inbound_pkt.seq_num < owned_bf.size() && owned_bf[inbound_pkt.seq_num];
+                    if (!already_owned && current_node.session->verify_and_process_incoming_block(inbound_pkt, expected_index)) {
 
-                        piece_mgr.write_piece_to_disk(inbound_pkt.seq_num, inbound_pkt.payload, inbound_pkt.data_len);
+                        if (!piece_mgr.write_piece_to_disk(inbound_pkt.seq_num, inbound_pkt.payload, inbound_pkt.data_len)) {
+                            std::cerr << "[DISK WRITE] Rejected piece #" << inbound_pkt.seq_num << " (validation failed)." << std::endl;
+                            continue;
+                        }
                         // We RECEIVED this piece from the peer -> this is a download from our perspective.
                         choke_mgr.record_download(origin_port, inbound_pkt.data_len);
                         peer_downloaded_bytes[origin_port] += inbound_pkt.data_len;
