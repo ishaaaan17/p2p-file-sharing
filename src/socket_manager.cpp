@@ -100,7 +100,19 @@ namespace P2P {
 
             if (received_bytes > 0 && m_is_running) {
                 std::vector<uint8_t> active_data(raw_buffer.begin(), raw_buffer.begin() + received_bytes);
-                Packet parsed_packet = Packet::deserialize(active_data.data(), active_data.size());
+
+                // deserialize() throws on short/malformed datagrams. Without
+                // this guard, any stray UDP packet to our port was an
+                // uncaught exception in a std::thread = process termination.
+                Packet parsed_packet;
+                try {
+                    parsed_packet = Packet::deserialize(active_data.data(), active_data.size());
+                }
+                catch (const std::exception& e) {
+                    std::cerr << "[SocketManager] Dropping malformed datagram ("
+                        << received_bytes << " bytes): " << e.what() << std::endl;
+                    continue;
+                }
 
                 char ip_str[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &remote_addr.sin_addr, ip_str, INET_ADDRSTRLEN);
