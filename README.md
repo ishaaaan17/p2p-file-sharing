@@ -65,48 +65,48 @@ Because every C++ node instance sends its telemetry to the same `127.0.0.1:6000`
 
 ```
                      ┌─────────────────────┐         ┌─────────────────────┐
-                     │   Seeder Node A      │         │   Seeder Node B      │
-                     │   (Peer ID 2002)     │         │   (Peer ID 2003)     │
-                     │   UDP :9999          │         │   UDP :8888          │
-                     │   Holds pieces 0-2    │         │   Holds pieces 3-5   │
-                     └──────────┬───────────┘         └──────────┬───────────┘
+                     │    Seeder Node A    │         │    Seeder Node B    │
+                     │    (Peer ID 2002)   │         │    (Peer ID 2003)   │
+                     │      UDP :9999      │         │      UDP :8888      │
+                     │   Holds pieces 0-2  │         │   Holds pieces 3-5  │
+                     └──────────┬──────────┘         └──────────┬──────────┘
                                 │  SYN / SYN_ACK / DATA / ACK / CHOKE / FIN
                                 │  (raw UDP datagrams)
-                                └───────────────┬───────────────┘
+                                └───────────────┬────────────────┘
                                                 ▼
-                              ┌───────────────────────────────────┐
-                              │      Downloader / Leecher Node      │
-                              │      (Peer ID 1001)  UDP :7777       │
-                              │                                       │
-                              │  ┌─────────────────────────────────┐ │
-                              │  │  Listener Thread                  │ │
-                              │  │  blocking recvfrom() loop         │ │
-                              │  │  → parses raw bytes into Packet   │ │
-                              │  │  → pushes onto thread-safe queue  │ │
-                              │  └───────────────┬───────────────────┘ │
-                              │                  │ (10ms poll)          │
-                              │  ┌───────────────▼───────────────────┐ │
-                              │  │  Main Thread                       │ │
-                              │  │  HandshakeManager                  │ │
-                              │  │  PeerSessionManager (rarest-first) │ │
-                              │  │  ChokeManager                      │ │
-                              │  │  PieceManager (disk seekp/seekg)   │ │
-                              │  └───────────────┬───────────────────┘ │
-                              └──────────────────┼──────────────────────┘
-                                                 │
-                                                 │  JSON telemetry frames
-                                                 │  (UDP loopback, same socket)
-                                                 ▼
-                              ┌───────────────────────────────────┐
-                              │  127.0.0.1 : 6000                    │
-                              │  Python Background Listener Thread   │
-                              │  → parses JSON → st.session_state    │
-                              └───────────────┬───────────────────┘
-                                              ▼
-                              ┌───────────────────────────────────┐
-                              │  Streamlit Browser UI                │
-                              │  Piece grid · Peer table · Progress  │
-                              └───────────────────────────────────┘
+                            ┌───────────────────────────────────────┐
+                            │       Downloader / Leecher Node       │
+                            │       (Peer ID 1001)  UDP :7777       │
+                            │                                       │
+                            │ ┌───────────────────────────────────┐ │
+                            │ │  Listener Thread                  │ │
+                            │ │  blocking recvfrom() loop         │ │
+                            │ │  → parses raw bytes into Packet   │ │
+                            │ │  → pushes onto thread-safe queue  │ │
+                            │ └─────────────────┬─────────────────┘ │
+                            │                   │ (10ms poll)       │
+                            │ ┌─────────────────▼─────────────────┐ │
+                            │ │  Main Thread                      │ │
+                            │ │  HandshakeManager                 │ │
+                            │ │  PeerSessionManager (rarest-first)│ │
+                            │ │  ChokeManager                     │ │
+                            │ │  PieceManager (disk seekp/seekg)  │ │
+                            │ └─────────────────┬─────────────────┘ │
+                            └───────────────────┼───────────────────┘
+                                                │
+                                                │  JSON telemetry frames
+                                                │  (UDP loopback, same socket)
+                                                ▼
+                             ┌────────────────────────────────────┐
+                             │  127.0.0.1 : 6000                  │
+                             │  Python Background Listener Thread │
+                             │  → parses JSON → st.session_state  │
+                             └──────────────────┬─────────────────┘
+                                                ▼
+                             ┌────────────────────────────────────┐
+                             │  Streamlit Browser UI              │
+                             │  Piece grid · Peer table · Progress│
+                             └────────────────────────────────────┘
 ```
 
 ---
